@@ -9,6 +9,7 @@
 #include "executor/execWorkfile.h"
 #include "utils/tuplestorenew.h"
 #include "utils/memutils.h"
+#include "utils/gp_alloc.h"
 
 #include "cdb/cdbvars.h"                /* currentSliceId */
 
@@ -168,8 +169,7 @@ struct NTupleStore
 };
 
 bool ntuplestore_is_readerwriter_reader(NTupleStore *nts) { return nts->rwflag == NTS_IS_READER; }
-bool ntuplestore_is_readerwriter_writer(NTupleStore *nts) { return nts->rwflag == NTS_IS_WRITER; }
-bool ntuplestore_is_readerwriter(NTupleStore *nts) { return nts->rwflag != NTS_NOT_READERWRITER; }
+
 /* Accessor to the tuplestore.
  * 
  * About the pos of an Accessor. 
@@ -436,7 +436,7 @@ static NTupleStorePage *nts_get_free_page(NTupleStore *nts)
 
 				if(nts->page_cnt >= page_max)
 				{
-					gp_free2(page_next, sizeof(NTupleStorePage));
+					gp_free(page_next);
 					--nts->page_cnt;
 				}
 				else
@@ -609,7 +609,7 @@ static void ntuplestore_cleanup(NTupleStore *ts, bool fNormal)
 	while(p)
 	{
 		NTupleStorePage *pnext = nts_page_next(p); 
-		gp_free2(p, sizeof(NTupleStorePage));
+		gp_free(p);
 		p = pnext;
 	}
 
@@ -617,7 +617,7 @@ static void ntuplestore_cleanup(NTupleStore *ts, bool fNormal)
 	while(p)
 	{
 		NTupleStorePage *pnext = nts_page_next(p); 
-		gp_free2(p, sizeof(NTupleStorePage));
+		gp_free(p);
 		p = pnext;
 	}
 
@@ -638,7 +638,7 @@ static void ntuplestore_cleanup(NTupleStore *ts, bool fNormal)
 		ts->work_set = NULL;
 	}
 
-	gp_free2(ts, sizeof(NTupleStore));
+	gp_free(ts);
 }
 
 static void XCallBack_NTS(XactEvent event, void *nts)
@@ -1447,30 +1447,6 @@ void ntuplestore_acc_seek_eof(NTupleStoreAccessor *tsa)
 	tsa->pos.slotn = nts_page_slot_cnt(tsa->page);
 }
 
-int ntuplestore_count_slot(NTupleStore *nts, NTupleStorePos *pos1, NTupleStorePos *pos2)
-{
-	NTupleStoreAccessor *tsa1 = ntuplestore_create_accessor(nts, false); 
-	NTupleStoreAccessor *tsa2 = ntuplestore_create_accessor(nts, false);
-
-	bool fOK;
-	int ret;
-	
-	fOK = ntuplestore_acc_seek(tsa1, pos1);
-	if(!fOK)
-		return -1;
-	fOK = ntuplestore_acc_seek(tsa2, pos2);
-	if(!fOK)
-		return -1;
-	
-	ret = ntuplestore_count_slot_acc(nts, tsa1, tsa2);
-	
-	ntuplestore_destroy_accessor(tsa1);
-	ntuplestore_destroy_accessor(tsa2);
-
-	return ret;
-}
-
-
 int ntuplestore_count_slot_acc(NTupleStore *nts, NTupleStoreAccessor *tsa1, NTupleStoreAccessor *tsa2)
 {
 	int ret = 0;
@@ -1556,24 +1532,6 @@ ntuplestore_create_spill_files(NTupleStore *nts)
 	nts->plobfile = workfile_mgr_create_fileno(nts->work_set, WORKFILE_NUM_TUPLESTORE_LOB);
 
 	MemoryContextSwitchTo(oldcxt);
-}
-
-/*
- * Mark the associated workfile set as complete
- */
-void
-ntuplestore_mark_workset_complete(NTupleStore *nts)
-{
-	Assert(nts != NULL);
-	if (nts->work_set == NULL)
-	{
-		return;
-	}
-	if (nts->workfiles_created)
-	{
-		elog(gp_workfile_caching_loglevel, "Tuplestore: Marking workset as complete");
-		workfile_mgr_mark_complete(nts->work_set);
-	}
 }
 
 /* EOF */

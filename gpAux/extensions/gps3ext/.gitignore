@@ -44,7 +44,19 @@ GTAGS
 GRTAGS
 core
 
+*.d
 *.gcov
 *.gcda
 *.gcno
+
 s3test
+gpcheckcloud
+
+s3.conf
+
+sql
+expected
+results
+
+*.out
+*.diffs

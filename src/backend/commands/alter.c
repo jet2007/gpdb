@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/alter.c,v 1.22 2007/01/23 05:07:17 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/alter.c,v 1.27 2008/02/07 21:07:55 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -35,7 +35,7 @@
 #include "utils/lsyscache.h"
 
 #include "cdb/cdbvars.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 
 
 /*
@@ -96,6 +96,8 @@ ExecRenameStmt(RenameStmt *stmt)
 			break;
 
 		case OBJECT_TABLE:
+		case OBJECT_SEQUENCE:
+		case OBJECT_VIEW:
 		case OBJECT_INDEX:
 		{
 			if (Gp_role == GP_ROLE_DISPATCH)
@@ -119,7 +121,7 @@ ExecRenameStmt(RenameStmt *stmt)
 				aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
 							   get_namespace_name(namespaceId));
 
-			renamerel(stmt->objid, stmt->newname, stmt);
+			renamerel(stmt->objid, stmt->newname, stmt->renameType, stmt);
 			break;
 		}
 
@@ -152,13 +154,33 @@ ExecRenameStmt(RenameStmt *stmt)
 				break;
 			}
 
+		case OBJECT_TSPARSER:
+			RenameTSParser(stmt->object, stmt->newname);
+			break;
+
+		case OBJECT_TSDICTIONARY:
+			RenameTSDictionary(stmt->object, stmt->newname);
+			break;
+
+		case OBJECT_TSTEMPLATE:
+			RenameTSTemplate(stmt->object, stmt->newname);
+			break;
+
+		case OBJECT_TSCONFIGURATION:
+			RenameTSConfiguration(stmt->object, stmt->newname);
+			break;
+
 		default:
 			elog(ERROR, "unrecognized rename stmt type: %d",
 				 (int) stmt->renameType);
 	}
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "ExecRenameStmt");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 
 }
@@ -199,7 +221,11 @@ ExecAlterObjectSchemaStmt(AlterObjectSchemaStmt *stmt)
 	}
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "ExecAlterObjectSchemaStmt");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 }
 
@@ -230,6 +256,10 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 			AlterFunctionOwner(stmt->object, stmt->objarg, newowner);
 			break;
 
+		case OBJECT_LANGUAGE:
+			AlterLanguageOwner(strVal(linitial(stmt->object)), newowner);
+			break;
+
 		case OBJECT_OPERATOR:
 			Assert(list_length(stmt->objarg) == 2);
 			AlterOperatorOwner(stmt->object,
@@ -258,21 +288,33 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 			AlterFileSpaceOwner(stmt->object, newowner);
 			break;
 
+		case OBJECT_EXTPROTOCOL:
+			AlterExtProtocolOwner(strVal(linitial(stmt->object)), newowner);
+			break;
+
 		case OBJECT_TYPE:
 		case OBJECT_DOMAIN:		/* same as TYPE */
 			AlterTypeOwner(stmt->object, newowner);
 			break;
-		
-		case OBJECT_EXTPROTOCOL:
-			AlterExtProtocolOwner(strVal(linitial(stmt->object)), newowner);
+
+		case OBJECT_TSDICTIONARY:
+			AlterTSDictionaryOwner(stmt->object, newowner);
 			break;
-			
+
+		case OBJECT_TSCONFIGURATION:
+			AlterTSConfigurationOwner(stmt->object, newowner);
+			break;
+
 		default:
 			elog(ERROR, "unrecognized AlterOwnerStmt type: %d",
 				 (int) stmt->objectType);
 	}
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "ExecAlterOwnerStmt");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 }

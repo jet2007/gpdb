@@ -249,8 +249,8 @@ select a,1 from orca.r group by rollup(a);
 select array[array[a,b]], array[b] from orca.r;
 
 -- setops
-select a, b from m union select b,a from orca.m;
-SELECT a from m UNION ALL select b from orca.m UNION ALL select a+b from orca.m group by 1;
+select a, b from orca.m union select b,a from orca.m;
+SELECT a from orca.m UNION ALL select b from orca.m UNION ALL select a+b from orca.m group by 1;
 
 ----------------------------------------------------------------------
 set optimizer=off;
@@ -474,6 +474,9 @@ insert into orca.t values('201208',2,'tag1','tag2');
 
 -- test projections
 select * from orca.t order by 1,2;
+
+-- test EXPLAIN support of partition selection nodes, while we're at it.
+explain select * from orca.t order by 1,2;
 
 select tag2, tag1 from orca.t order by 1, 2;;
 
@@ -1276,6 +1279,74 @@ explain select * from orca.index_test where c = 5;
 
 -- force_explain
 explain select * from orca.index_test where a = 5 and c = 5;
+
+-- renaming columns
+select * from (values (2),(null)) v(k);
+
+-- Checking if ORCA correctly populates canSetTag in PlannedStmt for multiple statements because of rules
+drop table if exists can_set_tag_target;
+create table can_set_tag_target
+(
+	x int,
+	y int,
+	z char
+);
+
+drop table if exists can_set_tag_audit;
+create table can_set_tag_audit
+(
+	t timestamp without time zone,
+	x int,
+	y int,
+	z char
+);
+
+create rule can_set_tag_audit_update AS
+    ON UPDATE TO can_set_tag_target DO  INSERT INTO can_set_tag_audit (t, x, y, z)
+  VALUES (now(), old.x, old.y, old.z);
+
+insert into can_set_tag_target select i, i + 1, i + 2 from generate_series(1,2) as i;
+
+create role unpriv;
+grant all on can_set_tag_target to unpriv;
+grant all on can_set_tag_audit to unpriv;
+set role unpriv;
+show optimizer;
+update can_set_tag_target set y = y + 1;
+select count(1) from can_set_tag_audit;
+reset role;
+
+revoke all on can_set_tag_target from unpriv;
+revoke all on can_set_tag_audit from unpriv;
+drop role unpriv;
+drop table can_set_tag_target;
+drop table can_set_tag_audit;
+
+-- start_ignore
+create language plpythonu;
+-- end_ignore
+
+-- Checking if ORCA uses parser's canSetTag for CREATE TABLE AS SELECT
+create or replace function canSetTag_Func(x int) returns int as $$
+    if (x is None):
+        return 0
+    else:
+        return x * 3
+$$ language plpythonu;
+
+create table canSetTag_input_data (domain integer, class integer, attr text, value integer)
+   distributed by (domain);
+insert into canSetTag_input_data values(1, 1, 'A', 1);
+insert into canSetTag_input_data values(2, 1, 'A', 0);
+insert into canSetTag_input_data values(3, 0, 'B', 1);
+
+create table canSetTag_bug_table as 
+SELECT attr, class, (select canSetTag_Func(count(distinct class)::int) from canSetTag_input_data)
+   as dclass FROM canSetTag_input_data GROUP BY attr, class distributed by (attr);
+
+drop function canSetTag_Func(x int);
+drop table canSetTag_bug_table;
+drop table canSetTag_input_data;
 
 -- clean up
 drop schema orca cascade;

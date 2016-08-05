@@ -10,7 +10,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/catalog/catalog.c,v 1.69 2007/01/05 22:19:24 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/catalog/catalog.c,v 1.72.2.1 2008/02/20 17:44:14 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -24,10 +24,14 @@
 #include "access/transam.h"
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_amproc.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_exttable.h"
+#include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_pltemplate.h"
 #include "catalog/pg_resqueue.h"
@@ -37,8 +41,10 @@
 #include "catalog/pg_filespace_entry.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_resqueue.h"
+#include "catalog/pg_rewrite.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_tidycat.h"
+#include "catalog/pg_trigger.h"
 
 #include "catalog/gp_configuration.h"
 #include "catalog/gp_configuration.h"
@@ -601,15 +607,17 @@ IsSystemNamespace(Oid namespaceId)
 
 /*
  * IsToastNamespace
- *		True iff namespace is pg_toast.
+ *		True iff namespace is pg_toast or my temporary-toast-table namespace.
  *
- * NOTE: the reason this isn't a macro is to avoid having to include
- * catalog/pg_namespace.h in a lot of places.
+ * Note: this will return false for temporary-toast-table namespaces belonging
+ * to other backends.  Those are treated the same as other backends' regular
+ * temp table namespaces, and access is prevented where appropriate.
  */
 bool
 IsToastNamespace(Oid namespaceId)
 {
-	return namespaceId == PG_TOAST_NAMESPACE;
+	return (namespaceId == PG_TOAST_NAMESPACE) ||
+		isTempToastNamespace(namespaceId);
 }
 
 /*
@@ -847,6 +855,47 @@ relationId == PgFileSpaceEntryToastIndex ||
 	return false;
 }
 
+/*
+ * OIDs for catalog object are normally allocated in the master, and
+ * executor nodes should just use the OIDs passed by the master. But
+ * there are some exceptions.
+ */
+static bool
+RelationNeedsSynchronizedOIDs(Relation relation)
+{
+	if (IsSystemNamespace(RelationGetNamespace(relation)))
+	{
+		switch(RelationGetRelid(relation))
+		{
+			/*
+			 * pg_largeobject is more like a user table, and has
+			 * different contents in each segment and master.
+			 */
+			case LargeObjectRelationId:
+				return false;
+
+			/*
+			 * We don't currently synchronize the OIDs of these catalogs.
+			 * It's a bit sketchy that we don't, but we get away with it
+			 * because these OIDs don't appear in any of the Node structs
+			 * that are dispatched from master to segments. (Except for the
+			 * OIDs, the contents of these tables should be in sync.)
+			 */
+			case RewriteRelationId:
+			case TriggerRelationId:
+			case AccessMethodOperatorRelationId:
+			case AccessMethodProcedureRelationId:
+				return false;
+		}
+
+		/*
+		 * All other system catalogs are assumed to need synchronized
+		 * OIDs.
+		 */
+		return true;
+	}
+	return false;
+}
 
 /*
  * GetNewOid
@@ -889,7 +938,6 @@ GetNewOid(Relation relation)
 	/* If no OID index, just hand back the next OID counter value */
 	if (!OidIsValid(oidIndex))
 	{
-		Oid result;
 		/*
 		 * System catalogs that have OIDs should *always* have a unique OID
 		 * index; we should only take this path for user tables. Give a
@@ -899,26 +947,25 @@ GetNewOid(Relation relation)
 			elog(WARNING, "generating possibly-non-unique OID for \"%s\"",
 				 RelationGetRelationName(relation));
 
-		result=  GetNewObjectId();
-		
-		if (IsSystemNamespace(RelationGetNamespace(relation)))
-		{
-			if (Gp_role == GP_ROLE_EXECUTE)
-			{
-				elog(DEBUG1,"Allocating Oid %u on relid %u %s in EXECUTE mode",result,relation->rd_id,RelationGetRelationName(relation));
-			}
-			if (Gp_role == GP_ROLE_DISPATCH)
-			{
-				elog(DEBUG5,"Allocating Oid %u on relid %u %s in DISPATCH mode",result,relation->rd_id,RelationGetRelationName(relation));
-			}
-		}
-		return result;
+		return GetNewObjectId();
 	}
 
 	/* Otherwise, use the index to find a nonconflicting OID */
 	indexrel = index_open(oidIndex, AccessShareLock);
 	newOid = GetNewOidWithIndex(relation, indexrel);
 	index_close(indexrel, AccessShareLock);
+
+	/*
+	 * Most catalog objects need to have the same OID in the master and all
+	 * segments. When creating a new object, the master should allocate the
+	 * OID and tell the segments to use the same, so segments should have no
+	 * need to ever allocate OIDs on their own. Therefore, give a WARNING if
+	 * GetNewOid() is called in a segment. (There are a few exceptions, see
+	 * RelationNeedsSynchronizedOIDs()).
+	 */
+	if (Gp_role == GP_ROLE_EXECUTE && RelationNeedsSynchronizedOIDs(relation))
+		elog(WARNING, "allocated OID %u for relation \"%s\" in segment",
+			 newOid, RelationGetRelationName(relation));
 
 	return newOid;
 }
@@ -939,9 +986,12 @@ Oid
 GetNewOidWithIndex(Relation relation, Relation indexrel)
 {
 	Oid			newOid;
+	SnapshotData SnapshotDirty;
 	IndexScanDesc scan;
 	ScanKeyData key;
 	bool		collides;
+
+	InitDirtySnapshot(SnapshotDirty);
 
 	/* Generate new OIDs until we find one not in the table */
 	do
@@ -957,27 +1007,12 @@ GetNewOidWithIndex(Relation relation, Relation indexrel)
 
 		/* see notes above about using SnapshotDirty */
 		scan = index_beginscan(relation, indexrel,
-							   SnapshotDirty, 1, &key);
+							   &SnapshotDirty, 1, &key);
 
 		collides = HeapTupleIsValid(index_getnext(scan, ForwardScanDirection));
 
 		index_endscan(scan);
 	} while (collides);
-	
-	if (IsSystemNamespace(RelationGetNamespace(relation)))
-	{
-		if (Gp_role == GP_ROLE_EXECUTE)
-		{
-			if (relation->rd_id != 2604 /* pg_attrdef */ && relation->rd_id != 2606 /* pg_constraint */ && relation->rd_id != 2615 /* pg_namespace */) 
-				elog(DEBUG1,"Allocating Oid %u with index on relid %u %s in EXECUTE mode",newOid,relation->rd_id, RelationGetRelationName(relation));
-			else
-				elog(DEBUG4,"Allocating Oid %u with index on relid %u %s in EXECUTE mode",newOid,relation->rd_id, RelationGetRelationName(relation));
-		}
-		if (Gp_role == GP_ROLE_DISPATCH)
-		{
-			elog(DEBUG5,"Allocating Oid %u with index on relid %u %s in DISPATCH mode",newOid,relation->rd_id,  RelationGetRelationName(relation));
-		}
-	}
 
 	return newOid;
 }
@@ -1071,8 +1106,10 @@ CheckNewRelFileNodeIsOk(Oid newOid, Oid reltablespace, bool relisshared,
 	char	   *rpath;
 	int			fd;
 	bool		collides;
-	
-	
+	SnapshotData SnapshotDirty;
+
+	InitDirtySnapshot(SnapshotDirty);
+
 	if (pg_class)
 	{
 		Oid			oidIndex;
@@ -1095,7 +1132,7 @@ CheckNewRelFileNodeIsOk(Oid newOid, Oid reltablespace, bool relisshared,
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(newOid));
 
-		scan = index_beginscan(pg_class, indexrel, SnapshotDirty, 1, &key);
+		scan = index_beginscan(pg_class, indexrel, &SnapshotDirty, 1, &key);
 
 		collides = HeapTupleIsValid(index_getnext(scan, ForwardScanDirection));
 

@@ -7,7 +7,7 @@
  * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/backend/commands/user.c,v 1.176 2007/02/01 19:10:26 momjian Exp $
+ * $PostgreSQL: pgsql/src/backend/commands/user.c,v 1.178.2.1 2010/03/25 14:45:06 alvherre Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -42,7 +42,7 @@
 #include "utils/resscheduler.h"
 #include "utils/syscache.h"
 
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 #include "cdb/cdbsrlz.h"
 #include "cdb/cdbvars.h"
 
@@ -583,7 +583,11 @@ CreateRole(CreateRoleStmt *stmt)
 	{
 		Assert(stmt->type == T_CreateRoleStmt);
 		Assert(stmt->type < 1000);
-		CdbDispatchUtilityStatement((Node *) stmt, "CreateRole");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 
 		/* MPP-6929: metadata tracking */
 		MetaTrackAddObject(AuthIdRelationId,
@@ -1172,7 +1176,11 @@ AlterRole(AlterRoleStmt *stmt)
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "AlterRole");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 }
 
@@ -1186,23 +1194,18 @@ AlterRoleSet(AlterRoleSetStmt *stmt)
 	char	   *valuestr;
 	HeapTuple	oldtuple,
 				newtuple;
+	Relation	rel;
 	Datum		repl_val[Natts_pg_authid];
 	bool		repl_null[Natts_pg_authid];
 	bool		repl_repl[Natts_pg_authid];
 	char	   *alter_subtype = "SET"; /* metadata tracking */
-	cqContext  *pcqCtx;
 
-	valuestr = flatten_set_variable_args(stmt->variable, stmt->value);
+	valuestr = ExtractSetVariableArgs(stmt->setstmt);
 
-	pcqCtx = caql_beginscan(
-			NULL,
-			cql("SELECT * FROM pg_authid "
-				" WHERE rolname = :1 "
-				" FOR UPDATE ",
-				CStringGetDatum(stmt->role)));
-
-	oldtuple = caql_getnext(pcqCtx);
-
+	rel = heap_open(AuthIdRelationId, RowExclusiveLock);
+	oldtuple = SearchSysCache(AUTHNAME,
+							  PointerGetDatum(stmt->role),
+							  0, 0, 0);
 	if (!HeapTupleIsValid(oldtuple))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -1231,26 +1234,27 @@ AlterRoleSet(AlterRoleSetStmt *stmt)
 	memset(repl_repl, false, sizeof(repl_repl));
 	repl_repl[Anum_pg_authid_rolconfig - 1] = true;
 
-	if (strcmp(stmt->variable, "all") == 0 && valuestr == NULL)
+	if (stmt->setstmt->kind == VAR_RESET_ALL)
 	{
-		alter_subtype = "RESET ALL";
-
 		ArrayType  *new = NULL;
 		Datum		datum;
 		bool		isnull;
+
+		alter_subtype = "RESET ALL";
 
 		/*
 		 * in RESET ALL, request GUC to reset the settings array; if none
 		 * left, we can set rolconfig to null; otherwise use the returned
 		 * array
 		 */
-		datum = caql_getattr(pcqCtx,
-							 Anum_pg_authid_rolconfig, &isnull);
+		datum = SysCacheGetAttr(AUTHNAME, oldtuple,
+								Anum_pg_authid_rolconfig, &isnull);
 		if (!isnull)
 			new = GUCArrayReset(DatumGetArrayTypeP(datum));
 		if (new)
 		{
 			repl_val[Anum_pg_authid_rolconfig - 1] = PointerGetDatum(new);
+			repl_repl[Anum_pg_authid_rolconfig - 1] = true;
 			repl_null[Anum_pg_authid_rolconfig - 1] = false;
 		}
 		else
@@ -1268,17 +1272,17 @@ AlterRoleSet(AlterRoleSetStmt *stmt)
 		repl_null[Anum_pg_authid_rolconfig - 1] = false;
 
 		/* Extract old value of rolconfig */
-		datum = caql_getattr(pcqCtx,
-							 Anum_pg_authid_rolconfig, &isnull);
+		datum = SysCacheGetAttr(AUTHNAME, oldtuple,
+								Anum_pg_authid_rolconfig, &isnull);
 		array = isnull ? NULL : DatumGetArrayTypeP(datum);
 
 		/* Update (valuestr is NULL in RESET cases) */
 		if (valuestr)
-			array = GUCArrayAdd(array, stmt->variable, valuestr);
+			array = GUCArrayAdd(array, stmt->setstmt->name, valuestr);
 		else
 		{
 			alter_subtype = "RESET";
-			array = GUCArrayDelete(array, stmt->variable);
+			array = GUCArrayDelete(array, stmt->setstmt->name);
 		}
 
 		if (array)
@@ -1287,11 +1291,11 @@ AlterRoleSet(AlterRoleSetStmt *stmt)
 			repl_null[Anum_pg_authid_rolconfig - 1] = true;
 	}
 
-	newtuple = caql_modify_current(pcqCtx, 
-								   repl_val, repl_null, repl_repl);
+	newtuple = heap_modify_tuple(oldtuple, RelationGetDescr(rel),
+								 repl_val, repl_null, repl_repl);
 
-	caql_update_current(pcqCtx, newtuple);
-	/* and Update indexes (implicit) */
+	simple_heap_update(rel, &oldtuple->t_self, newtuple);
+	CatalogUpdateIndexes(rel, newtuple);
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 		/* MPP-6929: metadata tracking */
@@ -1301,11 +1305,16 @@ AlterRoleSet(AlterRoleSetStmt *stmt)
 						   "ALTER", alter_subtype
 				);
 
-	caql_endscan(pcqCtx);
+	ReleaseSysCache(oldtuple);
 	/* needn't keep lock since we won't be updating the flat file */
+	heap_close(rel, RowExclusiveLock);
 
 	if (Gp_role == GP_ROLE_DISPATCH)
-		CdbDispatchUtilityStatement((Node *) stmt, "AlterRoleSetStmt");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 }
 
 
@@ -1480,7 +1489,11 @@ DropRole(DropRoleStmt *stmt)
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "DropRole");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 
 	}
 }
@@ -1693,7 +1706,11 @@ GrantRole(GrantRoleStmt *stmt)
 	auth_file_update_needed();
 
     if (Gp_role == GP_ROLE_DISPATCH)
-        CdbDispatchUtilityStatement((Node *) stmt, "GrantRole");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 
 }
 
@@ -1721,7 +1738,11 @@ DropOwnedObjects(DropOwnedStmt *stmt)
 	
 	if (Gp_role == GP_ROLE_DISPATCH)
     {
-        CdbDispatchUtilityStatement((Node *) stmt, "DropOwnedObjects");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
     }
     
 	/* Ok, do it */
@@ -1761,7 +1782,11 @@ ReassignOwnedObjects(ReassignOwnedStmt *stmt)
 				 
 	if (Gp_role == GP_ROLE_DISPATCH)
     {
-        CdbDispatchUtilityStatement((Node *) stmt, "ReassignOwnedObjects");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
     }
 
 	/* Ok, do it */

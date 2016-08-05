@@ -21,6 +21,8 @@
 #include "gpopt/init.h"
 #include "gpos/_api.h"
 
+#include "naucrates/exception.h"
+
 //---------------------------------------------------------------------------
 //	@function:
 //		CGPOptimizer::TouchLibraryInitializers
@@ -32,7 +34,7 @@
 void
 CGPOptimizer::TouchLibraryInitializers()
 {
-	void (*gpos)() = gpos_init;
+	void (*gpos)(gpos_init_params*) = gpos_init;
 	void (*dxl)() = gpdxl_init;
 	void (*opt)() = gpopt_init;
 }
@@ -53,7 +55,23 @@ CGPOptimizer::PplstmtOptimize
 	bool *pfUnexpectedFailure // output : set to true if optimizer unexpectedly failed to produce plan
 	)
 {
-	return COptTasks::PplstmtOptimize(pquery, pfUnexpectedFailure);
+	GPOS_TRY
+	{
+		return COptTasks::PplstmtOptimize(pquery, pfUnexpectedFailure);
+	}
+	GPOS_CATCH_EX(ex)
+	{
+		if (GPOS_MATCH_EX(ex, gpdxl::ExmaDXL, gpdxl::ExmiWarningAsError))
+		{
+		  elog(ERROR, "PQO unable to generate plan, please see the above message for details.");
+		}
+		if (GPOS_MATCH_EX(ex, gpdxl::ExmaGPDB, gpdxl::ExmiGPDBError))
+		{
+		  elog(ERROR, "GPDB exception. Aborting PQO plan generation.");
+		}
+	}
+	GPOS_CATCH_END;
+	return NULL;
 }
 
 
@@ -74,6 +92,39 @@ CGPOptimizer::SzDXLPlan
 	return COptTasks::SzOptimize(pquery);
 }
 
+//---------------------------------------------------------------------------
+//	@function:
+//		InitGPOPT()
+//
+//	@doc:
+//		Initialize GPTOPT and dependent libraries
+//
+//---------------------------------------------------------------------------
+void
+CGPOptimizer::InitGPOPT ()
+{
+  // Use GPORCA's default allocators
+  struct gpos_init_params params = { NULL, NULL };
+  gpos_init(&params);
+  gpdxl_init();
+  gpopt_init();
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		TerminateGPOPT()
+//
+//	@doc:
+//		Terminate GPOPT and dependent libraries
+//
+//---------------------------------------------------------------------------
+void
+CGPOptimizer::TerminateGPOPT ()
+{
+  gpopt_terminate();
+  gpdxl_terminate();
+  gpos_terminate();
+}
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -111,6 +162,38 @@ char *SzDXLPlan
 	)
 {
 	return CGPOptimizer::SzDXLPlan(pquery);
+}
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		InitGPOPT()
+//
+//	@doc:
+//		Initialize GPTOPT and dependent libraries
+//
+//---------------------------------------------------------------------------
+extern "C"
+{
+void InitGPOPT ()
+{
+	return CGPOptimizer::InitGPOPT();
+}
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		TerminateGPOPT()
+//
+//	@doc:
+//		Terminate GPOPT and dependent libraries
+//
+//---------------------------------------------------------------------------
+extern "C"
+{
+void TerminateGPOPT ()
+{
+	return CGPOptimizer::TerminateGPOPT();
 }
 }
 

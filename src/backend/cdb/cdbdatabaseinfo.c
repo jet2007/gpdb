@@ -6,8 +6,8 @@
  *
  *-------------------------------------------------------------------------
  */
-#include "c.h"
 #include "postgres.h"
+
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/palloc.h"
@@ -25,7 +25,7 @@
 #include "catalog/pg_tablespace.h"
 #include "cdb/cdbpersistentdatabase.h"
 #include "cdb/cdbdirectopen.h"
-#include "catalog/pg_appendonly.h"
+#include "catalog/pg_appendonly_fn.h"
 #include "access/aosegfiles.h"
 #include "access/aocssegfiles.h"
 #include "access/appendonlytid.h"
@@ -359,7 +359,7 @@ static DbInfoRel *DatabaseInfo_FindRelationId(
 static void DatabaseInfo_AddPgAppendOnly(
 	HTAB 				*pgAppendOnlyHashTable,	
 	Oid					 relationId,
-	AppendOnlyEntry 	*aoEntry)
+	Form_pg_appendonly 	 aoEntry)
 {
 	PgAppendOnlyHashEntry *pgAppendOnlyHashEntry;
 
@@ -383,9 +383,9 @@ static void DatabaseInfo_AddPgAppendOnly(
  * DatabaseInfo_FindPgAppendOnly()
  *   Lookup an entry to a pgAppendOnly hash table.
  */
-static AppendOnlyEntry *DatabaseInfo_FindPgAppendOnly(
+static Form_pg_appendonly
+DatabaseInfo_FindPgAppendOnly(
 	HTAB 				*pgAppendOnlyHashTable,
-	
 	Oid					relationId)
 {
 	PgAppendOnlyHashEntry *pgAppendOnlyHashEntry;
@@ -1013,7 +1013,7 @@ DatabaseInfo_HandleAppendOnly(
 		if (dbInfoRel->relstorage == RELSTORAGE_AOROWS ||
 			dbInfoRel->relstorage == RELSTORAGE_AOCOLS)
 		{
-			AppendOnlyEntry 	*aoEntry;
+			Form_pg_appendonly 	 aoEntry;
 			DbInfoRel 			*aosegDbInfoRel;
 			int i;
 				
@@ -1034,7 +1034,7 @@ DatabaseInfo_HandleAppendOnly(
 					 aoEntry->majorversion,
 					 aoEntry->minorversion,
 					 (aoEntry->checksum ? "true" : "false"),
-					 (aoEntry->compresstype ? aoEntry->compresstype : "NULL"),
+					 NameStr(aoEntry->compresstype),
 					 (aoEntry->columnstore ? "true" : "false"),
 					 aoEntry->segrelid,
 					 aoEntry->segidxid,
@@ -1069,7 +1069,6 @@ DatabaseInfo_HandleAppendOnly(
 				aoSegfileArray = 
 						GetAllFileSegInfo_pg_aoseg_rel(
 												dbInfoRel->relname, 
-												aoEntry,
 												pg_aoseg_rel,
 												SnapshotNow, 
 												&totalAoSegFiles);
@@ -1100,7 +1099,6 @@ DatabaseInfo_HandleAppendOnly(
 				aocsSegfileArray = GetAllAOCSFileSegInfo_pg_aocsseg_rel(
 																dbInfoRel->relnatts,
 																dbInfoRel->relname, 
-																aoEntry, 
 																pg_aocsseg_rel,
 																SnapshotNow, 
 																&totalAocsSegFiles);
@@ -1147,20 +1145,9 @@ DatabaseInfo_CollectPgAppendOnly(
 	scan = heap_beginscan(pg_appendonly_rel, SnapshotNow, 0, NULL);
 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
-		bool			nulls[Natts_pg_appendonly];
-		Datum			values[Natts_pg_appendonly];
-				
-		AppendOnlyEntry *aoEntry;
+		Form_pg_appendonly aoEntry;
 
-		Oid 			relationId;
-				
-		heap_deform_tuple(tuple, RelationGetDescr(pg_appendonly_rel), values, nulls);
-
-		aoEntry = GetAppendOnlyEntryFromTuple(
-									pg_appendonly_rel,
-									RelationGetDescr(pg_appendonly_rel),
-									tuple,
-									&relationId);
+		aoEntry = (Form_pg_appendonly) GETSTRUCT(tuple);
 
 		Assert(aoEntry != NULL);
 
@@ -1169,14 +1156,14 @@ DatabaseInfo_CollectPgAppendOnly(
 				 "DatabaseInfo_Collect: Append-Only entry for relation id %u, "
 				 "blocksize %d, safefswritesize %d, compresslevel %d, major version %d, minor version %d, "
 				 " checksum %s, compresstype %s, columnstore %s, segrelid %u, segidxid %u, blkdirrelid %u, blkdiridxid %u",
-				 relationId,
+				 aoEntry->relid,
 				 aoEntry->blocksize,
 				 aoEntry->safefswritesize,
 				 aoEntry->compresslevel,
 				 aoEntry->majorversion,
 				 aoEntry->minorversion,
 				 (aoEntry->checksum ? "true" : "false"),
-				 (aoEntry->compresstype ? aoEntry->compresstype : "NULL"),
+				 NameStr(aoEntry->compresstype),
 				 (aoEntry->columnstore ? "true" : "false"),
 				 aoEntry->segrelid,
 				 aoEntry->segidxid,
@@ -1185,7 +1172,7 @@ DatabaseInfo_CollectPgAppendOnly(
 
 		DatabaseInfo_AddPgAppendOnly(
 								pgAppendOnlyHashTable,
-								relationId,
+								aoEntry->relid,
 								aoEntry);
 	}
 	heap_endscan(scan);
@@ -1199,12 +1186,20 @@ DatabaseInfo_CollectPgClass(
 	DatabaseInfo 		*info,
 	HTAB				*dbInfoRelHashTable,
 	HTAB				*relationIdHashTable,
+	Snapshot			 snapshot,
 	int					*count)
 {
 	Relation	pg_class_rel;
 
 	HeapScanDesc scan;
 	HeapTuple	tuple;
+
+	/*
+	 * If the caller isn't providing a Snapshot to use, fall back to using
+	 * SnapshotNow
+	 */
+	if (snapshot == NULL)
+		snapshot = SnapshotNow;
 
 	/*
 	 * Iterate through all the relations of the database and determine which
@@ -1215,7 +1210,7 @@ DatabaseInfo_CollectPgClass(
 			DirectOpen_PgClassOpen(
 							info->defaultTablespace, 
 							info->database);
-	scan = heap_beginscan(pg_class_rel, SnapshotNow, 0, NULL);
+	scan = heap_beginscan(pg_class_rel, snapshot, 0, NULL);
 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
 		Oid 			relationOid;
@@ -1277,7 +1272,6 @@ DatabaseInfo_CollectPgClass(
 	heap_endscan(scan);
 
 	DirectOpen_PgClassClose(pg_class_rel);
-
 }
 
 /*
@@ -1374,6 +1368,7 @@ DatabaseInfo *
 DatabaseInfo_Collect(
 	Oid			database,
 	Oid 		defaultTablespace,
+	Snapshot	snapshot,
 	bool        collectGpRelationNodeInfo,
 	bool		collectAppendOnlyCatalogSegmentInfo,
 	bool		scanFileSystem)
@@ -1425,7 +1420,7 @@ DatabaseInfo_Collect(
 	 *   - from gp_relation_node [if specified]
 	 *   - from file system
 	 */
-	DatabaseInfo_CollectPgClass(info, dbInfoRelHashTable, relationIdHashTable, &count);
+	DatabaseInfo_CollectPgClass(info, dbInfoRelHashTable, relationIdHashTable, NULL, &count);
 	DatabaseInfo_CollectPgAppendOnly(info, pgAppendOnlyHashTable);
 
 	if (info->collectAppendOnlyCatalogSegmentInfo)

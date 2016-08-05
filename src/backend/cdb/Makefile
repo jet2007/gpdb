@@ -12,15 +12,14 @@ include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I$(top_srcdir)/src/backend/gp_libpq_fe $(CPPFLAGS)
 override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
 
-SUBDIRS := motion
+SUBDIRS := motion dispatcher
 
 
 OBJS = cdbappendonlystorage.o cdbappendonlystorageformat.o \
        cdbappendonlystorageread.o cdbappendonlystoragewrite.o \
 	   cdbbackup.o cdbbufferedappend.o cdbbufferedread.o \
-	   cdbcat.o cdbcellbuf.o cdbconn.o cdbcopy.o \
+	   cdbcat.o cdbcellbuf.o cdbcopy.o \
 	   cdbdatabaseinfo.o cdbdirectopen.o \
-	   cdbdisp.o cdbdispatchresult.o \
 	   cdbdistributedsnapshot.o \
 	   cdbdistributedxid.o cdbdistributedxacts.o \
 	   cdbdoublylinked.o \
@@ -34,10 +33,9 @@ OBJS = cdbappendonlystorage.o cdbappendonlystorageformat.o \
 	   cdbfilerepresetpeerprocess.o \
 	   cdbfts.o \
 	   cdbglobalsequence.o \
-	   cdbgang.o cdbgroup.o \
+	   cdbgroup.o \
 	   cdbhash.o cdbheap.o \
 	   cdbllize.o cdblocaldistribxact.o \
-	   cdbmaxdistributedxid.o \
 	   cdbmirroredbufferpool.o \
 	   cdbmirroredfilesysobj.o cdbmirroredflatfile.o \
 	   cdbmirroredappendonly.o \

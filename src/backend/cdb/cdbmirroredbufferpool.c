@@ -733,7 +733,7 @@ bool MirroredBufferPool_Write(
 		if (writeBuf == NULL)
 			ereport(ERROR, 
 					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 (errmsg("could not allocate memory for mirrored alligned buffer"))));
+					 (errmsg("could not allocate memory for mirrored aligned buffer"))));
 	}	
 	
 	/*
@@ -1508,7 +1508,7 @@ bool MirroredBufferPool_Truncate(
 		{
 			if (Debug_filerep_print)
 				ereport(LOG,
-					(errmsg("could not sent file truncate request to mirror "), 
+					(errmsg("could not send file truncate request to mirror "),
 							FileRep_ReportRelationPath(
 													   open->mirrorFilespaceLocation,
 													   open->relFileNode,

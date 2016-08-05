@@ -266,13 +266,6 @@ ExecMotion(MotionState * node)
 		} else
 			node->ps.state->active_recv_id = motion->motionID;
 
-		/* Running in diagnostic mode ? */
-		if (Gp_interconnect_type == INTERCONNECT_TYPE_NIL)
-		{
-			node->ps.state->active_recv_id = -1;
-			return NULL;
-		}
-
 		if (motion->sendSorted)
         {
             if (gp_enable_motion_mk_sort)
@@ -380,15 +373,6 @@ execMotionSender(MotionState * node)
 			node->otherTime.tv_sec++;
 		}
 #endif
-		/* Running in diagnostic mode, we just drop all tuples. */
-		if (Gp_interconnect_type == INTERCONNECT_TYPE_NIL)
-		{
-			if (!TupIsNull(outerTupleSlot))
-				continue;
-
-			return NULL;
-		}
-
 		if (done || TupIsNull(outerTupleSlot))
 		{
 			doSendEndOfStream(motion, node);
@@ -533,7 +517,7 @@ execMotionUnsortedReceiver(MotionState * node)
  * We keep track of which one was selected, this will be slot we will need
  * to fill during the next call.
  *
- * Subsuquent calls to this function (after the 1st time) will start by
+ * Subsequent calls to this function (after the 1st time) will start by
  * trying to receive a tuple for the slot that was emptied the previous call.
  * Then we again select the lowest value and return that tuple.
  *
@@ -657,7 +641,7 @@ static void create_motion_mk_heap(MotionState *node)
     
 static void destroy_motion_mk_heap(MotionState *node)
 {
-    /* Don't need to do anything.  Memory are allocated from
+    /* Don't need to do anything.  Memory is allocated from
      * query execution context.  By calling this, we are at
      * the end of the life of a query. 
      */
@@ -935,8 +919,6 @@ ExecInitMotion(Motion * node, EState *estate, int eflags)
     Slice      *recvSlice = NULL;
     SliceTable *sliceTable = estate->es_sliceTable;
 
-	int			parentSliceIndex = estate->currentSliceIdInPlan;
-
 #ifdef CDB_MOTION_DEBUG
 	int			i;
 #endif
@@ -968,44 +950,9 @@ ExecInitMotion(Motion * node, EState *estate, int eflags)
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
 		MemoryContext   oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
-        Flow           *sendFlow;
-
-        /* Top node of subplan should have a Flow node. */
-        Insist(node->plan.lefttree && node->plan.lefttree->flow);
-        sendFlow = node->plan.lefttree->flow;
-
-        /* Sending slice table entry hasn't been filled in yet. */
-        Assert(sendSlice->rootIndex == -1);
-		Assert(sendSlice->gangSize == 0);
 
 		/* Look up the receiving (parent) gang's slice table entry. */
-		recvSlice = (Slice *)list_nth(sliceTable->slices, parentSliceIndex);
-
-		Assert(IsA(recvSlice, Slice));
-		Assert(recvSlice->sliceIndex == parentSliceIndex);
-        Assert(recvSlice->rootIndex == 0 ||
-               (recvSlice->rootIndex > sliceTable->nMotions &&
-                recvSlice->rootIndex < list_length(sliceTable->slices)));
-
-		/* Sending slice become a children of recv slice */
-		recvSlice->children = lappend_int(recvSlice->children, sendSlice->sliceIndex);
-		sendSlice->parentIndex = parentSliceIndex;
-        sendSlice->rootIndex = recvSlice->rootIndex;
-
-		/* The gang beneath a Motion will be a reader. */
-		sendSlice->gangType = GANGTYPE_PRIMARY_READER;
-
-	    /* How many sending processes in the dispatcher array? Note that targeted dispatch may reduce this number in practice */
-		sendSlice->gangSize = 1;
-	    if (sendFlow->flotype != FLOW_SINGLETON)
-	    	sendSlice->gangSize = getgpsegmentCount();
-
-        /* Does sending slice need 1-gang with read-only access to entry db? */
-        if (sendFlow->flotype == FLOW_SINGLETON &&
-            sendFlow->segindex == -1)
-            sendSlice->gangType = GANGTYPE_ENTRYDB_READER;
-
-        sendSlice->numGangMembersToBeActive = sliceCalculateNumSendingProcesses(sendSlice, getgpsegmentCount());
+		recvSlice = (Slice *)list_nth(sliceTable->slices, sendSlice->parentIndex);
 
 		if (node->motionType == MOTIONTYPE_FIXED && node->numOutputSegs == 1)
 		{
@@ -1020,7 +967,7 @@ ExecInitMotion(Motion * node, EState *estate, int eflags)
 			{
 				Assert(recvSlice->gangSize == 1);
 				Assert(node->outputSegIdx[0] >= 0
-					   ? (recvSlice->gangType == GANGTYPE_PRIMARY_READER || 
+					   ? (recvSlice->gangType == GANGTYPE_SINGLETON_READER ||
 						  recvSlice->gangType == GANGTYPE_ENTRYDB_READER)
 					   : recvSlice->gangType == GANGTYPE_ENTRYDB_READER);
 			}
@@ -1106,7 +1053,7 @@ ExecInitMotion(Motion * node, EState *estate, int eflags)
 		/*
 		 * Create hash API reference
 		 */
-		motionstate->cdbhash = makeCdbHash(node->numOutputSegs, HASH_FNV_1);
+		motionstate->cdbhash = makeCdbHash(node->numOutputSegs);
     }
 
 	/* Merge Receive: Set up the key comparator and priority queue. */
@@ -1734,9 +1681,6 @@ ExecStopMotion(MotionState * node)
 	motion = (Motion *) node->ps.plan;
 	node->stopRequested = true;
 	node->ps.state->active_recv_id = -1;
-
-	if (Gp_interconnect_type == INTERCONNECT_TYPE_NIL)
-		return;
 
 	/* pass down */
 	SendStopMessage(node->ps.state->motionlayer_context,

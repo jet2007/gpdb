@@ -215,8 +215,13 @@
 
 #define GP_WRAP_END	\
 		}	\
+		else \
+		{ \
+			EmitErrorReport(); \
+			FlushErrorState(); \
+			GPOS_RAISE(gpdxl::ExmaGPDB, gpdxl::ExmiGPDBError); \
+		} \
 	}	\
-	GPOS_RAISE(gpdxl::ExmaGPDB, gpdxl::ExmiGPDBError)
 
 using namespace gpos;
 
@@ -2858,7 +2863,7 @@ gpdb::CheckRTPermissions
 {
 	GP_WRAP_START;
 	{
-		ExecCheckRTPerms(plRangeTable);	
+		ExecCheckRTPerms(plRangeTable);
 		return;
 	}
 	GP_WRAP_END;
@@ -2940,12 +2945,13 @@ Expr *
 gpdb::PexprEvaluate
 	(
 	Expr *pexpr,
-	Oid oidResultType
+	Oid oidResultType,
+	int32 iTypeMod
 	)
 {
 	GP_WRAP_START;
 	{
-		return evaluate_expr(pexpr, oidResultType);
+		return evaluate_expr(pexpr, oidResultType, iTypeMod);
 	}
 	GP_WRAP_END;
 	return NULL;
@@ -2969,13 +2975,12 @@ gpdb::FInterpretOidsOption
 char *
 gpdb::SzDefGetString
 	(
-	DefElem *pdefelem,
-	bool *fNeedFree
+	DefElem *pdefelem
 	)
 {
 	GP_WRAP_START;
 	{
-		return defGetString(pdefelem, fNeedFree);
+		return defGetString(pdefelem);
 	}
 	GP_WRAP_END;
 	return NULL;
@@ -3066,7 +3071,13 @@ static int64 mdcache_invalidation_counter = 0;
 static int64 last_mdcache_invalidation_counter = 0;
 
 static void
-mdcache_invalidation_counter_callback(Datum arg, Oid relid)
+mdsyscache_invalidation_counter_callback(Datum arg, int cacheid,  ItemPointer tuplePtr)
+{
+	mdcache_invalidation_counter++;
+}
+
+static void
+mdrelcache_invalidation_counter_callback(Datum arg, Oid relid)
 {
 	mdcache_invalidation_counter++;
 }
@@ -3130,12 +3141,12 @@ register_mdcache_invalidation_callbacks(void)
 	for (i = 0; i < lengthof(metadata_caches); i++)
 	{
 		CacheRegisterSyscacheCallback(metadata_caches[i],
-									  &mdcache_invalidation_counter_callback,
+									  &mdsyscache_invalidation_counter_callback,
 									  (Datum) 0);
 	}
 
 	/* also register the relcache callback */
-	CacheRegisterRelcacheCallback(&mdcache_invalidation_counter_callback,
+	CacheRegisterRelcacheCallback(&mdrelcache_invalidation_counter_callback,
 								  (Datum) 0);
 }
 

@@ -4,10 +4,10 @@
  *	  POSTGRES generalized index access method definitions.
  *
  *
- * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/access/genam.h,v 1.66 2007/01/05 22:19:50 momjian Exp $
+ * $PostgreSQL: pgsql/src/include/access/genam.h,v 1.81 2009/08/01 20:59:17 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -41,6 +41,7 @@ typedef struct IndexVacuumInfo
 	bool		vacuum_full;	/* VACUUM FULL (we have exclusive lock) */
 	int			message_level;	/* ereport level for progress messages */
 	double		num_heap_tuples;	/* tuples remaining in heap */
+	BufferAccessStrategy strategy;		/* access strategy for reads */
 	List        *extra_oids;    /* For bitmap indexes: store three relfilenode oids
 								 * for reindexing a bitmap index.
 								 */
@@ -134,6 +135,8 @@ extern FmgrInfo *index_getprocinfo(Relation irel, AttrNumber attnum,
 extern IndexScanDesc RelationGetIndexScan(Relation indexRelation,
 					 int nkeys, ScanKey key);
 extern void IndexScanEnd(IndexScanDesc scan);
+extern char *BuildIndexValueDescription(Relation indexRelation,
+						   Datum *values, bool *isnull);
 
 /*
  * heap-or-index access to system catalogs (in genam.c)

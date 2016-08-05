@@ -47,6 +47,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/pg_rusage.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 
@@ -75,9 +76,12 @@ typedef struct AnlIndexData
 /* Default statistics target (GUC parameter) */
 int			default_statistics_target = 10;
 
+/* A few variables that don't seem worth passing around as parameters */
 static int	elevel = -1;
 
 static MemoryContext anl_context = NULL;
+
+static BufferAccessStrategy vac_strategy;
 
 
 static void BlockSampler_Init(BlockSampler bs, BlockNumber nblocks,
@@ -106,362 +110,12 @@ static bool std_typanalyze(VacAttrStats *stats);
 static void analyzeEstimateReltuplesRelpages(Oid relationOid, float4 *relTuples, float4 *relPages, bool rootonly);
 static void analyzeEstimateIndexpages(Relation onerel, Relation indrel, BlockNumber *indexPages);
 
-
-static void analyzeStmt(VacuumStmt *stmt, List *relids);
-
-/**
- * This is the main entry point for analyze execution. Three possible ways of calling this method.
- * 1. Full database ANALYZE. No relations are explicitly specified.
- * 2. List of relations is specified (Usually by autovacuum).
- * 3. One relation is specified (optionally, a list of columns).
- * This method can only be called in DISPATCH or UTILITY roles.
- * Input:
- * 	vacstmt - Vacuum statement.
- * 	relids  - Usually NULL except when called by autovacuum.
- */
-void analyzeStatement(VacuumStmt *stmt, List *relids)
-{
-	/* MPP-14608: Analyze may create temp tables.
-	 * Disable autostats so that analyze is not called during their creation. */
-
-	GpAutoStatsModeValue autostatvalBackup = gp_autostats_mode;
-	GpAutoStatsModeValue autostatInFunctionsvalBackup = gp_autostats_mode_in_functions;
-	bool optimizerBackup = optimizer;
-
-	gp_autostats_mode = GP_AUTOSTATS_NONE;
-	gp_autostats_mode_in_functions = GP_AUTOSTATS_NONE;
-	optimizer = false;
-
-	PG_TRY();
-	{
-		analyzeStmt(stmt, relids);
-		gp_autostats_mode = autostatvalBackup;
-		gp_autostats_mode_in_functions = autostatInFunctionsvalBackup;
-		optimizer = optimizerBackup;
-	}
-
-	/* Clean up in case of error. */
-	PG_CATCH();
-	{
-		gp_autostats_mode = autostatvalBackup;
-		gp_autostats_mode_in_functions = autostatInFunctionsvalBackup;
-		optimizer = optimizerBackup;
-
-		/* Carry on with error handling. */
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	Assert(gp_autostats_mode == autostatvalBackup);
-	Assert(gp_autostats_mode_in_functions == autostatInFunctionsvalBackup);
-	Assert(optimizer == optimizerBackup);
-}
-
-/**
- * If ANALYZE is requested with no relations specified, this method is called to build
- * the implicit list of relations from pg_class. Only those with relkind == RELKIND_RELATION
- * are considered.
- * If rootonly is true, we only analyze root partition table.
- *
- * Input:
- * 	None
- * Output:
- * 	List of relids
- */
-static List *
-analyzableRelations(bool rootonly)
-{
-	List	   *lRelOids = NIL;
-	cqContext  *pcqCtx;
-	HeapTuple	tuple;
-
-	pcqCtx = caql_beginscan(
-			NULL,
-			cql("SELECT * FROM pg_class "
-				" WHERE relkind = :1 ",
-				CharGetDatum(RELKIND_RELATION)));
-
-	while (HeapTupleIsValid(tuple = caql_getnext(pcqCtx)))
-	{
-		Oid			candidateOid = HeapTupleGetOid(tuple);
-
-		if (rootonly && !rel_is_partitioned(candidateOid))
-		{
-			continue;
-		}
-
-		if (candidateOid == StatisticRelationId)
-			continue;
-
-		if (pg_class_ownercheck(candidateOid, GetUserId()) 
-			|| pg_database_ownercheck(MyDatabaseId, GetUserId()))
-		{
-			lRelOids = lappend_oid(lRelOids, candidateOid);
-		}
-	}
-
-	caql_endscan(pcqCtx);
-
-	return lRelOids;
-}
-
-/**
- * This method can only be called in DISPATCH or UTILITY roles.
- * Input:
- * 	vacstmt - Vacuum statement.
- * 	relids  - Usually NULL except when called by autovacuum.
- */
-static void
-analyzeStmt(VacuumStmt *stmt, List *relids)
-{
-	List	   			  	*lRelOids = NIL;
-	MemoryContext			callerContext = NULL;
-	MemoryContext 			analyzeStatementContext = NULL;
-	MemoryContext 			analyzeRelationContext = NULL;
-	bool					bUseOwnXacts = false;
-	ListCell				*le1 = NULL;
-
-	/**
-	 * Ensure that an ANALYZE is requested.
-	 */
-	Assert(stmt->analyze);	
-	
-	/**
-	 * Ensure that vacuum was not requested.
-	 */
-	Assert(!stmt->vacuum);
-	
-	/**
-	 * Both relids and stmt->relation cannot be non-null.
-	 */
-	Assert(!(relids != NIL && stmt->relation != NULL));
-	
-	/**
-	 * Works only in DISPATCH and UTILITY mode.
-	 */
-	Assert(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY);
-	
-	/**
-	 * Only works in normal processing mode - should not be called in bootstrapping or
-	 * init mode.
-	 */
-	Assert(IsNormalProcessingMode());
-	
-	/* If running in diagnostic mode, simply return */
-	if (Gp_interconnect_type == INTERCONNECT_TYPE_NIL)
-	{
-		return;
-	}
-	
-	if (stmt->verbose)
-		elevel = INFO;
-	else
-		elevel = DEBUG2;
-
-	callerContext = CurrentMemoryContext;
-
-	/*
-	 * This is the statement-level context. This will be cleaned up when we exit this
-	 * function.
-	 */
-	analyzeStatementContext = AllocSetContextCreate(PortalContext,
-			"Analyze",
-			ALLOCSET_DEFAULT_MINSIZE,
-			ALLOCSET_DEFAULT_INITSIZE,
-			ALLOCSET_DEFAULT_MAXSIZE);
-
-	MemoryContextSwitchTo(analyzeStatementContext);
-
-
-	/*
-	 * This is a per relation context.
-	 */
-	analyzeRelationContext = AllocSetContextCreate(analyzeStatementContext,
-			"AnalyzeRel",
-			ALLOCSET_DEFAULT_MINSIZE,
-			ALLOCSET_DEFAULT_INITSIZE,
-			ALLOCSET_DEFAULT_MAXSIZE);
-
-	/**
-	 * What relations need to be ANALYZED.
-	 */
-	if (relids == NIL && stmt->relation == NULL)
-	{
-		/**
-		 * ANALYZE entire DB.
-		 */
-		lRelOids = analyzableRelations(stmt->rootonly);
-		if (stmt->rootonly && NIL == lRelOids)
-		{
-			ereport(WARNING,
-					(errmsg("there are no partitioned tables in database to ANALYZE ROOTPARTITION")));
-		}
-	}
-	else if (relids != NIL)
-	{
-		/**
-		 * ANALYZE called by autovacuum.
-		 */
-		lRelOids = relids;
-	}
-	else
-	{
-		/**
-		 * ANALYZE one relation (optionally, a list of columns).
-		 */
-		Oid relationOid = InvalidOid;
-		Assert(relids == NIL);
-		Assert(stmt->relation != NULL);
-		relationOid = RangeVarGetRelid(stmt->relation, false);
-		PartStatus ps = rel_part_status(relationOid);
-
-		if (ps != PART_STATUS_ROOT && stmt->rootonly)
-		{
-			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- cannot analyze a non-root partition using ANALYZE ROOTPARTITION",
-							get_rel_name(relationOid))));
-		}
-		else if (ps == PART_STATUS_ROOT)
-		{
-			PartitionNode *pn = get_parts(relationOid, 0 /*level*/ ,
-		 	 	            0 /*parent*/, false /* inctemplate */, true /*includesubparts*/);
-			Assert(pn);
-			if (!stmt->rootonly)
-			{
-				lRelOids = all_leaf_partition_relids(pn); /* all leaves */
-			}
-			lRelOids = lappend_oid(lRelOids, relationOid); /* root partition */
-			if (optimizer_analyze_midlevel_partition)
-			{
-				lRelOids = list_concat(lRelOids, all_interior_partition_relids(pn)); /* interior partitions */
-			}
-		}
-		else if (ps == PART_STATUS_INTERIOR) /* analyze an interior partition directly */
-		{
-			/* disable analyzing mid-level partitions directly since the users are encouraged
-			 * to work with the root partition only. To gather stats on mid-level partitions
-			 * (for Orca's use), the user should run ANALYZE or ANALYZE ROOTPARTITION on the
-			 * root level.
-			 */
-			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- cannot analyze a mid-level partition. "
-							"Please run ANALYZE on the root partition table.",
-							get_rel_name(relationOid))));
-		}
-		else
-		{
-			lRelOids = list_make1_oid(relationOid);
-		}
-	}
-
-	/*
-	 * Decide whether we need to start/commit our own transactions.
-	 * The scenarios in which we can start/commit our own transactions are:
-	 * 1. We are not in a transaction block and there are multiple relations specified (some of them may be implicit)
-	 * 2. We are in autovacuum mode
-	 */
-
-	if ((!IsInTransactionChain((void *) stmt) && list_length(lRelOids) > 1)
-			|| IsAutoVacuumWorkerProcess())
-		bUseOwnXacts = true;
-
-	/**
-	 * Iterate through all relids in the list and issue analyze on all columns on each relation.
-	 */
-
-	if (bUseOwnXacts)
-	{
-		/*
-		 * We commit the transaction started in PostgresMain() here, and start
-		 * another one before exiting to match the commit waiting for us back in
-		 * PostgresMain().
-		 */
-		CommitTransactionCommand();
-		MemoryContextSwitchTo(analyzeStatementContext);
-	}
-
-	foreach (le1, lRelOids)
-	{
-		Oid				candidateOid	  = InvalidOid;
-		bool			bTemp;
-
-		bTemp = false;
-
-		Assert(analyzeStatementContext == CurrentMemoryContext);
-
-		if (bUseOwnXacts)
-		{
-			/**
-			 * We use a different transaction per relation so that we
-			 * may release locks on relations as soon as possible.
-			 */
-			setupRegularDtxContext();
-			StartTransactionCommand();
-			ActiveSnapshot = CopySnapshot(GetTransactionSnapshot());
-			MemoryContextSwitchTo(analyzeStatementContext);
-		}
-
-		candidateOid = lfirst_oid(le1);
-
-		/* Switch to per relation context */
-		MemoryContextSwitchTo(analyzeRelationContext);
-
-		analyze_rel(candidateOid, stmt);
-
-		/* Switch back to statement context and reset relation context */
-		MemoryContextSwitchTo(analyzeStatementContext);
-		MemoryContextResetAndDeleteChildren(analyzeRelationContext);
-
-
-		/* MPP-6929: metadata tracking */
-		if (!bTemp && (Gp_role == GP_ROLE_DISPATCH))
-		{
-			char *asubtype = "";
-
-			if (IsAutoVacuumWorkerProcess())
-				asubtype = "AUTO";
-
-			MetaTrackUpdObject(RelationRelationId,
-							   candidateOid,
-							   GetUserId(),
-							   "ANALYZE",
-							   asubtype
-				);
-		}
-
-		if (bUseOwnXacts)
-		{
-			/**
-			 * We commit the transaction so that locks on the relation may be released.
-			 */
-			CommitTransactionCommand();
-			MemoryContextSwitchTo(analyzeStatementContext);
-		}
-	}
-
-	if (bUseOwnXacts)
-	{
-		/**
-		 * We start a new transaction command to match the one in PostgresMain().
-		 */
-		setupRegularDtxContext();
-		StartTransactionCommand();
-		ActiveSnapshot = CopySnapshot(GetTransactionSnapshot());
-		MemoryContextSwitchTo(analyzeStatementContext);
-	}
-
-	Assert(analyzeStatementContext == CurrentMemoryContext);
-	MemoryContextSwitchTo(callerContext);
-	MemoryContextDelete(analyzeStatementContext);
-}
-
-
-
-
 /*
  *	analyze_rel() -- analyze one relation
  */
 void
-analyze_rel(Oid relid, VacuumStmt *vacstmt)
+analyze_rel(Oid relid, VacuumStmt *vacstmt,
+			BufferAccessStrategy bstrategy)
 {
 	Relation	onerel;
 	int			attr_cnt,
@@ -480,11 +134,18 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt)
 				totaldeadrows;
 	BlockNumber	totalpages;
 	HeapTuple  *rows;
+	PGRUsage	ru0;
+	TimestampTz starttime = 0;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
 
 	if (vacstmt->verbose)
 		elevel = INFO;
 	else
 		elevel = DEBUG2;
+
+	vac_strategy = bstrategy;
 
 	/*
 	 * Use the current context for storing analysis info.  vacuum.c ensures
@@ -529,12 +190,12 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt)
 	 * Check that it's a plain table; we used to do this in get_rel_oids() but
 	 * seems safer to check after we've locked the relation.
 	 */
-	if (onerel->rd_rel->relkind != RELKIND_RELATION)
+	if (onerel->rd_rel->relkind != RELKIND_RELATION || RelationIsExternal(onerel))
 	{
 		/* No need for a WARNING if we already complained during VACUUM */
 		if (!vacstmt->vacuum)
 			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- cannot analyze indexes, views, or special system tables",
+					(errmsg("skipping \"%s\" --- cannot analyze indexes, views, external tables, or special system tables",
 							RelationGetRelationName(onerel))));
 		relation_close(onerel, ShareUpdateExclusiveLock);
 		return;
@@ -565,6 +226,29 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt)
 			(errmsg("analyzing \"%s.%s\"",
 					get_namespace_name(RelationGetNamespace(onerel)),
 					RelationGetRelationName(onerel))));
+
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(onerel->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+
+	/* let others know what I'm doing */
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	MyProc->vacuumFlags |= PROC_IN_ANALYZE;
+	LWLockRelease(ProcArrayLock);
+
+	/* measure elapsed time iff autovacuum logging requires it */
+	if (IsAutoVacuumWorkerProcess() && Log_autovacuum_min_duration >= 0)
+	{
+		pg_rusage_init(&ru0);
+		if (Log_autovacuum_min_duration > 0)
+			starttime = GetCurrentTimestamp();
+	}
 
 	/*
 	 * Determine which columns to analyze
@@ -774,7 +458,7 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt)
 	 */
 	if (!vacstmt->vacuum)
 	{
-		vac_update_relstats(onerel,
+		vac_update_relstats(RelationGetRelid(onerel),
 							totalpages,
 							totalrows, hasindex,
 							InvalidTransactionId);
@@ -809,7 +493,7 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt)
 			}
 
 			totalindexrows = ceil(thisdata->tupleFract * totalrows);
-			vac_update_relstats(Irel[ind],
+			vac_update_relstats(RelationGetRelid(Irel[ind]),
 								estimatedIndexPages,
 								totalindexrows, false,
 								InvalidTransactionId);
@@ -819,11 +503,41 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt)
 		pgstat_report_analyze(onerel, totalrows, totaldeadrows);
 	}
 
+	/* MPP-6929: metadata tracking */
+	if (!vacuumStatement_IsTemporary(onerel) && (Gp_role == GP_ROLE_DISPATCH))
+	{
+		char *asubtype = "";
+
+		if (IsAutoVacuumWorkerProcess())
+			asubtype = "AUTO";
+
+		MetaTrackUpdObject(RelationRelationId,
+						   relid,
+						   GetUserId(),
+						   "ANALYZE",
+						   asubtype
+			);
+	}
+
 	/* We skip to here if there were no analyzable columns */
 cleanup:
 
 	/* Done with indexes */
 	vac_close_indexes(nindexes, Irel, NoLock);
+
+	/* Log the action if appropriate */
+	if (IsAutoVacuumWorkerProcess() && Log_autovacuum_min_duration >= 0)
+	{
+		if (Log_autovacuum_min_duration == 0 ||
+			TimestampDifferenceExceeds(starttime, GetCurrentTimestamp(),
+									   Log_autovacuum_min_duration))
+			ereport(LOG,
+					(errmsg("automatic analyze of table \"%s.%s.%s\" system usage: %s",
+							get_database_name(MyDatabaseId),
+							get_namespace_name(RelationGetNamespace(onerel)),
+							RelationGetRelationName(onerel),
+							pg_rusage_show(&ru0))));
+	}
 
 	/*
 	 * Close source relation now, but keep lock so that no one deletes it
@@ -832,6 +546,20 @@ cleanup:
 	 * expose us to concurrent-update failures in update_attstats.)
 	 */
 	relation_close(onerel, NoLock);
+
+	/*
+	 * Reset my PGPROC flag.  Note: we need this here, and not in vacuum_rel,
+	 * because the vacuum flag is cleared by the end-of-xact code.
+	 */
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+	MyProc->vacuumFlags &= ~PROC_IN_ANALYZE;
+	LWLockRelease(ProcArrayLock);
+
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
 }
 
 /*
@@ -1189,12 +917,16 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 	double		deadrows = 0;	/* # dead rows seen */
 	double		rowstoskip = -1;	/* -1 means not set yet */
 	BlockNumber totalblocks;
+	TransactionId OldestXmin;
 	BlockSamplerData bs;
 	double		rstate;
 
 	Assert(targrows > 1);
 
 	totalblocks = RelationGetNumberOfBlocks(onerel);
+
+	/* Need a cutoff xmin for HeapTupleSatisfiesVacuum */
+	OldestXmin = GetOldestXmin(onerel->rd_rel->relisshared, true);
 
 	/* Prepare for sampling block numbers */
 	BlockSampler_Init(&bs, totalblocks, targrows);
@@ -1216,10 +948,12 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 		 * We must maintain a pin on the target page's buffer to ensure that
 		 * the maxoffset value stays good (else concurrent VACUUM might delete
 		 * tuples out from under us).  Hence, pin the page until we are done
-		 * looking at it.  We don't maintain a lock on the page, so tuples
-		 * could get added to it, but we ignore such tuples.
+		 * looking at it.  We also choose to hold sharelock on the buffer
+		 * throughout --- we could release and re-acquire sharelock for
+		 * each tuple, but since we aren't doing much work per tuple, the
+		 * extra lock traffic is probably better avoided.
 		 */
-		targbuffer = ReadBuffer(onerel, targblock);
+		targbuffer = ReadBufferWithStrategy(onerel, targblock, vac_strategy);
 		LockBuffer(targbuffer, BUFFER_LOCK_SHARE);
 		targpage = BufferGetPage(targbuffer);
 		maxoffset = PageGetMaxOffsetNumber(targpage);
@@ -1229,6 +963,22 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 		{
 			ItemId		itemid;
 			HeapTupleData targtuple;
+			bool		sample_it = false;
+
+			itemid = PageGetItemId(targpage, targoffset);
+
+			/*
+			 * We ignore unused and redirect line pointers.  DEAD line
+			 * pointers should be counted as dead, because we need vacuum
+			 * to run to get rid of them.  Note that this rule agrees with
+			 * the way that heap_page_prune() counts things.
+			 */
+			if (!ItemIdIsNormal(itemid))
+			{
+				if (ItemIdIsDead(itemid))
+					deadrows += 1;
+				continue;
+			}
 
 			itemid = PageGetItemId(targpage, targoffset);
 
@@ -1247,10 +997,76 @@ acquire_sample_rows(Relation onerel, HeapTuple *rows, int targrows,
 
 			ItemPointerSet(&targtuple.t_self, targblock, targoffset);
 
-			/* We use heap_release_fetch to avoid useless bufmgr traffic */
-			if (heap_release_fetch(onerel, SnapshotNow,
-								   &targtuple, &targbuffer,
-								   true, NULL))
+			targtuple.t_data = (HeapTupleHeader) PageGetItem(targpage, itemid);
+			targtuple.t_len = ItemIdGetLength(itemid);
+
+			switch (HeapTupleSatisfiesVacuum(onerel,
+											 targtuple.t_data,
+											 OldestXmin,
+											 targbuffer))
+			{
+				case HEAPTUPLE_LIVE:
+					sample_it = true;
+					liverows += 1;
+					break;
+
+				case HEAPTUPLE_DEAD:
+				case HEAPTUPLE_RECENTLY_DEAD:
+					/* Count dead and recently-dead rows */
+					deadrows += 1;
+					break;
+
+				case HEAPTUPLE_INSERT_IN_PROGRESS:
+					/*
+					 * Insert-in-progress rows are not counted.  We assume
+					 * that when the inserting transaction commits or aborts,
+					 * it will send a stats message to increment the proper
+					 * count.  This works right only if that transaction ends
+					 * after we finish analyzing the table; if things happen
+					 * in the other order, its stats update will be
+					 * overwritten by ours.  However, the error will be
+					 * large only if the other transaction runs long enough
+					 * to insert many tuples, so assuming it will finish
+					 * after us is the safer option.
+					 *
+					 * A special case is that the inserting transaction might
+					 * be our own.  In this case we should count and sample
+					 * the row, to accommodate users who load a table and
+					 * analyze it in one transaction.  (pgstat_report_analyze
+					 * has to adjust the numbers we send to the stats collector
+					 * to make this come out right.)
+					 */
+					if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(targtuple.t_data)))
+					{
+						sample_it = true;
+						liverows += 1;
+					}
+					break;
+
+				case HEAPTUPLE_DELETE_IN_PROGRESS:
+					/*
+					 * We count delete-in-progress rows as still live, using
+					 * the same reasoning given above; but we don't bother to
+					 * include them in the sample.
+					 *
+					 * If the delete was done by our own transaction, however,
+					 * we must count the row as dead to make
+					 * pgstat_report_analyze's stats adjustments come out
+					 * right.  (Note: this works out properly when the row
+					 * was both inserted and deleted in our xact.)
+					 */
+					if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmax(targtuple.t_data)))
+						deadrows += 1;
+					else
+						liverows += 1;
+					break;
+
+				default:
+					elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
+					break;
+			}
+
+			if (sample_it)
 			{
 				/*
 				 * The first targrows sample rows are simply copied into the
@@ -1607,12 +1423,38 @@ acquire_sample_rows_by_query(Relation onerel, int nattrs, VacAttrStats **attrsta
 	elog(elevel, "Executing SQL: %s", str.data);
 
 	/*
-	 * Do the query. We pass readonly==false, to force SPI to take a new
-	 * snapshot. That ensures that we see all changes by our own transaction.
+	 * Temporarily disable ORCA because it's slow to start up, and it
+	 * wouldn't come up with any better plan for this simple query.
 	 */
-	ret = SPI_execute(str.data, false, 0);
-	Assert(ret > 0);
-	sampleTuples = SPI_processed;
+	{
+		bool		optimizerBackup = optimizer;
+
+		optimizer = false;
+
+		PG_TRY();
+		{
+			/*
+			 * Do the query. We pass readonly==false, to force SPI to take a new
+			 * snapshot. That ensures that we see all changes by our own transaction.
+			 */
+			ret = SPI_execute(str.data, false, 0);
+			Assert(ret > 0);
+			sampleTuples = SPI_processed;
+
+			optimizer = optimizerBackup;
+		}
+
+		/* Clean up in case of error. */
+		PG_CATCH();
+		{
+			optimizer = optimizerBackup;
+
+			/* Carry on with error handling. */
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		Assert(optimizer == optimizerBackup);
+	}
 
 	/* Ok, read in the tuples to *rows */
 	MemoryContextSwitchTo(oldcxt);
@@ -1661,40 +1503,6 @@ acquire_sample_rows_by_query(Relation onerel, int nattrs, VacAttrStats **attrsta
 }
 
 
-/*
- * A convenience routine, to fetch two float4's from the current SPI result.
- *
- * The result set is expected to contain a single row, with a single
- * float4 array column, with two values in the array.
- */
-static void
-spi_getSingleResultRowArrayAsTwoFloat4(float4 *out1, float *out2)
-{
-	Datum		arrayDatum;
-	bool		isNull;
-	Datum	   *values = NULL;
-	int			valuesLength;
-
-    Assert(SPI_tuptable != NULL);
-    Assert(SPI_processed == 1);
-
-    arrayDatum = heap_getattr(SPI_tuptable->vals[0], 1, SPI_tuptable->tupdesc, &isNull);
-    Assert(!isNull);
-
-    deconstruct_array(DatumGetArrayTypeP(arrayDatum),
-            FLOAT4OID,
-            sizeof(float4),
-            true,
-            'i',
-            &values, NULL, &valuesLength);
-    Assert(valuesLength == 2);
-
-	*out1 = DatumGetFloat4(values[0]);
-	*out2 = DatumGetFloat4(values[1]);
-    pfree(values);
-}
-
-
 /**
  * This method estimates reltuples/relpages for a relation. To do this, it employs
  * the built-in function 'gp_statistics_estimate_reltuples_relpages'. If the table to be
@@ -1735,9 +1543,11 @@ analyzeEstimateReltuplesRelpages(Oid relationOid, float4 *relTuples, float4 *rel
 	{
 		Oid			singleOid = lfirst_oid(lc);
 		StringInfoData	sqlstmt;
-		float4      tuples;
-		float4      pages;
 		int			ret;
+		Datum		arrayDatum;
+		bool		isNull;
+		Datum	   *values = NULL;
+		int			valuesLength;
 
 		initStringInfo(&sqlstmt);
 
@@ -1764,9 +1574,20 @@ analyzeEstimateReltuplesRelpages(Oid relationOid, float4 *relTuples, float4 *rel
 		Assert(SPI_tuptable != NULL);
 		Assert(SPI_processed == 1);
 
-		spi_getSingleResultRowArrayAsTwoFloat4(&tuples, &pages);
-		*relTuples += tuples;
-		*relPages += pages;
+		arrayDatum = heap_getattr(SPI_tuptable->vals[0], 1, SPI_tuptable->tupdesc, &isNull);
+		if (isNull)
+			elog(ERROR, "could not get estimated number of tuples and pages for relation %u", singleOid);
+
+		deconstruct_array(DatumGetArrayTypeP(arrayDatum),
+						  FLOAT4OID,
+						  sizeof(float4),
+						  true,
+						  'i',
+						  &values, NULL, &valuesLength);
+		Assert(valuesLength == 2);
+
+		*relTuples += DatumGetFloat4(values[0]);
+		*relPages += DatumGetFloat4(values[1]);
 
 		SPI_finish();
 	}
@@ -1787,10 +1608,10 @@ analyzeEstimateIndexpages(Relation onerel, Relation indrel, BlockNumber *indexPa
 {
 	StringInfoData 	sqlstmt;
 	int			ret;
-	float4      tuples;
-	float4      pages;
-
-	*indexPages = 0;
+	Datum		arrayDatum;
+	bool		isNull;
+	Datum	   *values = NULL;
+	int			valuesLength;
 
 	initStringInfo(&sqlstmt);
 
@@ -1817,9 +1638,20 @@ analyzeEstimateIndexpages(Relation onerel, Relation indrel, BlockNumber *indexPa
 	if (SPI_processed != 1)
 		elog(ERROR, "unexpected number of rows returned for internal analyze query");
 
-	spi_getSingleResultRowArrayAsTwoFloat4(&tuples, &pages);
+    arrayDatum = heap_getattr(SPI_tuptable->vals[0], 1, SPI_tuptable->tupdesc, &isNull);
+	if (isNull)
+		elog(ERROR, "could not get estimated number of tuples and pages for index \"%s\"",
+			 RelationGetRelationName(indrel));
 
-	*indexPages = (BlockNumber) pages;
+    deconstruct_array(DatumGetArrayTypeP(arrayDatum),
+            FLOAT4OID,
+            sizeof(float4),
+            true,
+            'i',
+            &values, NULL, &valuesLength);
+    Assert(valuesLength == 2);
+
+	*indexPages = DatumGetFloat4(values[1]);
 
 	SPI_finish();
 

@@ -590,13 +590,13 @@ namespace gpdb {
 
 	// returns the result of evaluating 'pexpr' as an Expr. Caller keeps ownership of 'pexpr'
 	// and takes ownership of the result 
-	Expr *PexprEvaluate(Expr *pexpr, Oid oidResultType);
+	Expr *PexprEvaluate(Expr *pexpr, Oid oidResultType, int32 iTypeMod);
 	
 	// interpret the value of "With oids" option from a list of defelems
 	bool FInterpretOidsOption(List *plOptions);
 	
 	// extract string value from defelem's value
-	char *SzDefGetString(DefElem *pdefelem, bool *fNeedFree);
+	char *SzDefGetString(DefElem *pdefelem);
 
 	// fold array expression constant values
 	Node *PnodeFoldArrayexprConstants(ArrayExpr *parrayexpr);

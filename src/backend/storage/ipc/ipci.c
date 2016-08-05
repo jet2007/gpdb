@@ -42,7 +42,6 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgwriter.h"
-#include "postmaster/checkpoint.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/primary_mirror_mode.h"
 #include "postmaster/seqserver.h"
@@ -58,6 +57,7 @@
 #include "storage/spin.h"
 #include "utils/resscheduler.h"
 #include "utils/faultinjector.h"
+#include "utils/sharedsnapshot.h"
 #include "utils/simex.h"
 
 #include "cdb/cdbfts.h"
@@ -148,7 +148,6 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 			}
 		}
 		size = add_size(size, ProcGlobalShmemSize());
-		size = add_size(size, LocalDistribXact_ShmemSize());
 		size = add_size(size, XLOGShmemSize());
 		size = add_size(size, DistributedLog_ShmemSize());
 		size = add_size(size, CLOGShmemSize());
@@ -216,6 +215,9 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 			 (unsigned long) size);
 
 		size = add_size(size, BgWriterShmemSize());
+		size = add_size(size, AutoVacuumShmemSize());
+		size = add_size(size, BTreeShmemSize());
+		size = add_size(size, SyncScanShmemSize());
 		size = add_size(size, CheckpointShmemSize());
 
 		size = add_size(size, WalSndShmemSize());
@@ -344,7 +346,6 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	GPMemoryProtect_ShmemInit();
 
 	CreateSharedProcArray();
-	LocalDistribXact_ShmemCreate();
 	CreateSharedBackendStatus();
 	
 	/*
@@ -408,6 +409,7 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	 * Set up other modules that need some shared memory space
 	 */
 	BTreeShmemInit();
+	SyncScanShmemInit();
 	workfile_mgr_cache_init();
 
 #ifdef EXEC_BACKEND

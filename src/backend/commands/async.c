@@ -95,6 +95,7 @@
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
+#include "storage/proc.h"
 #include "storage/sinval.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
@@ -124,12 +125,12 @@ typedef enum
 typedef struct
 {
 	ListenActionKind action;
-	char		condname[1];	/* actually, as long as needed */
+	char		condname[1];				/* actually, as long as needed */
 } ListenAction;
 
-static List *pendingActions = NIL;		/* list of ListenAction */
+static List *pendingActions = NIL;			/* list of ListenAction */
 
-static List *upperPendingActions = NIL; /* list of upper-xact lists */
+static List *upperPendingActions = NIL;		/* list of upper-xact lists */
 
 /*
  * State for outbound notifies consists of a list of all relnames NOTIFYed
@@ -147,7 +148,7 @@ static List *upperPendingActions = NIL; /* list of upper-xact lists */
  * condition name, it will get a self-notify at commit.  This is a bit odd
  * but is consistent with our historical behavior.
  */
-static List *pendingNotifies = NIL;		/* list of C strings */
+static List *pendingNotifies = NIL;				/* list of C strings */
 
 static List *upperPendingNotifies = NIL;		/* list of upper-xact lists */
 
@@ -960,9 +961,11 @@ ProcessIncomingNotify(void)
 	bool		repl[Natts_pg_listener],
 				nulls[Natts_pg_listener];
 	bool		catchup_enabled;
+	bool		client_wait_timeout_enabled;
 
-	/* Must prevent SIGUSR1 interrupt while I am running */
+	/* Must prevent SIGUSR1 and SIGALRM(for IdleSessionGangTimeout) interrupt while I am running */
 	catchup_enabled = DisableCatchupInterrupt();
+	client_wait_timeout_enabled = DisableClientWaitTimeoutInterrupt();
 
 	if (Trace_notify)
 		elog(DEBUG1, "ProcessIncomingNotify");
@@ -1042,6 +1045,9 @@ ProcessIncomingNotify(void)
 
 	if (catchup_enabled)
 		EnableCatchupInterrupt();
+
+	if (client_wait_timeout_enabled)
+		EnableClientWaitTimeoutInterrupt();
 }
 
 /*

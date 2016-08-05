@@ -1,8 +1,18 @@
 #!/usr/bin/env python
-import re, os, signal, time, filecmp, stat, fileinput
+import filecmp
+import fileinput
+import os
+import re
+import signal
+import stat
+import time
+import glob
+import shutil
+
 import yaml
-from gppylib.commands.gp import GpStart, chk_local_db_running
+
 from gppylib.commands.base import Command, ExecutionError, REMOTE
+from gppylib.commands.gp import chk_local_db_running
 from gppylib.db import dbconn
 from gppylib.gparray import GpArray, MODE_SYNCHRONIZED
 from gppylib.operations.backup_utils import pg, escapeDoubleQuoteInSQLString
@@ -139,6 +149,13 @@ def check_return_code(context, ret_code):
             emsg += context.error_message
         raise Exception("expected return code '%s' does not equal actual return code '%s' %s" % (ret_code, context.ret_code, emsg))
 
+def check_not_return_code(context, ret_code):
+    if context.ret_code == int(ret_code):
+        emsg = ""
+        if context.error_message:
+            emsg += context.error_message
+        raise Exception("return code unexpectedly equals '%s' %s" % (ret_code, emsg))
+
 def check_database_is_running(context):
     if not 'PGPORT' in os.environ:
         raise Exception('PGPORT should be set')
@@ -236,7 +253,7 @@ def get_table_data_to_file(filename, tablename, dbname):
     current_dir = os.getcwd()
     filename = os.path.join(current_dir, './gppylib/test/data', filename)
     order_sql = """
-                    select string_agg(a, ',')
+                    select string_agg(a::text, ',')
                         from (
                             select generate_series(1,c.relnatts+1) as a
                                 from pg_class as c
@@ -329,7 +346,7 @@ def check_table_exists(context, dbname, table_name, table_type=None, host=None, 
         SQL = """
               select c.oid, c.relkind, c.relstorage, c.reloptions
               from pg_class c, pg_namespace n
-              where c.relname = E'%s' and n.nspname = E'%s' and c.relnamespace = n.oid;
+              where c.relname = '%s' and n.nspname = '%s' and c.relnamespace = n.oid;
               """ % (pg.escape_string(tablename), pg.escape_string(schemaname))
     else:
         SQL = """
@@ -1437,3 +1454,25 @@ def check_count_for_specific_query(dbname, query, nrows):
         result = dbconn.execSQLForSingleton(conn, NUM_ROWS_QUERY)
     if result != nrows:
         raise Exception('%d rows in table %s.%s, expected row count = %d' % (result, dbname, tablename, nrows))
+
+def get_primary_segment_host_port():
+    """
+    return host, port of primary segment (dbid 2)
+    """
+    FIRST_PRIMARY_DBID = 2
+    get_psegment_sql = 'select hostname, port from gp_segment_configuration where dbid=%i;' % FIRST_PRIMARY_DBID
+    with dbconn.connect(dbconn.DbURL(dbname='template1')) as conn:
+        cur = dbconn.execSQL(conn, get_psegment_sql)
+        rows = cur.fetchall()
+        primary_seg_host = rows[0][0]
+        primary_seg_port = rows[0][1]
+    return primary_seg_host, primary_seg_port
+
+def remove_local_path(dirname):
+    list = glob.glob(os.path.join(os.path.curdir, dirname))
+    for dir in list:
+        shutil.rmtree(dir, ignore_errors=True)
+
+def validate_local_path(path):
+    list = glob.glob(os.path.join(os.path.curdir, path))
+    return len(list)

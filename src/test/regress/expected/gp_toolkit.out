@@ -352,13 +352,12 @@ select autnspname,autrelname,autrelkind from gp_toolkit.__gp_user_tables where a
 -- gp_param_settings\(\)
 select paramsegment,paramname from gp_toolkit.gp_param_settings() where paramname like 'gp_%' and paramsegment=0 and paramname IN ('gp_contentid', 'gp_dbid', 'gp_interconnect_type', 'gp_role', 'gp_session_id') order by 2;
  paramsegment |      paramname       
---------------+----------------------
+--------------+---------------
             0 | gp_contentid
             0 | gp_dbid
-            0 | gp_interconnect_type
             0 | gp_role
             0 | gp_session_id
-(5 rows)
+(4 rows)
 
 -- Expected to have no results
 -- However it will show there is a difference if segment guc is different
@@ -496,12 +495,12 @@ from gp_toolkit.gp_size_of_schema_disk where sosdnsp='tktest' order by 1;
 (1 row)
 
 -- gp_size_of_database
--- We assume the regression database is between 30 MB and 1GB in size
+-- We assume the regression database is between 30 MB and 5GB in size
 select sodddatname,
        sodddatsize > 30000000 as "db size over 30MB",
-       sodddatsize < 1000000000 as "db size below 1 GB"
+       sodddatsize < 5000000000 as "db size below 5 GB"
 from gp_toolkit.gp_size_of_database where sodddatname='regression';
- sodddatname | db size over 30MB | db size below 1 GB 
+ sodddatname | db size over 30MB | db size below 5 GB 
 -------------+-------------------+--------------------
  regression  | t                 | t
 (1 row)

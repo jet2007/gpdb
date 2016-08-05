@@ -267,14 +267,6 @@ static const PQconninfoOption PQconninfoOptions[] = {
 		"gp-debug-qeid", "D", 40,
 	offsetof(struct pg_conn, gpqeid)},
 	
-	{"gpqdid", NULL, "", NULL,
-		"gp-debug-qdid", "D", 40,
-	offsetof(struct pg_conn, gpqdid)},
-	
-	{"gpdaid", NULL, "", NULL,
-		"gp-debug-daid", "D", 40,
-	offsetof(struct pg_conn, gpdaid)},
-
 	{"replication", NULL, NULL, NULL,
 		"Replication", "D", 5,
 	offsetof(struct pg_conn, replication)},
@@ -1709,6 +1701,7 @@ keep_going:						/* We will come back to here until there is
 					if (!IS_AF_UNIX(addr_cur->ai_family))
 					{
 						int			on = 1;
+						int			reuse = 1;
 						int			usekeepalives = useKeepalives(conn);
 						int			err = 0;
 
@@ -1741,7 +1734,17 @@ keep_going:						/* We will come back to here until there is
 						else if (!setKeepalivesWin32(conn))
 							err = 1;
 #endif /* SIO_KEEPALIVE_VALS */
-#endif /* WIN32 */
+#endif /* WIN32 */				
+
+						/* Need to set SO_REUSEADDR so the TCP port can be 
+						 * reused, or else, master might run out of TCP port */	
+						if (setsockopt(conn->sock, SOL_SOCKET, SO_REUSEADDR, (char *) &reuse, sizeof(reuse)) == -1)
+						{
+							appendPQExpBuffer(&conn->errorMessage, 
+									  libpq_gettext("setsockopt(SO_REUSEADDR) failed: %s\n"),
+									  SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
+							err = 1;
+						}
 
 						if (err)
 						{
@@ -2405,10 +2408,6 @@ makeEmptyPGconn(void)
 	conn->status = CONNECTION_BAD;
 	conn->asyncStatus = PGASYNC_IDLE;
 	conn->xactStatus = PQTRANS_IDLE;
-	conn->QEWriter_HaveInfo = false;
-	conn->QEWriter_DistributedTransactionId = 0;
-	conn->QEWriter_CommandId = 0;
-	conn->QEWriter_Dirty = false;
 	conn->options_valid = false;
 	conn->nonblocking = false;
 	conn->setenv_state = SETENV_STATE_IDLE;
@@ -2515,10 +2514,6 @@ freePGconn(PGconn *conn)
 
     if (conn->gpqeid)			/* CDB */
         free(conn->gpqeid);
-    if (conn->gpqdid)			/* CDB */
-        free(conn->gpqdid);
-    if (conn->gpdaid)			/* CDB */
-        free(conn->gpdaid);
     if (conn->qe_version)		/* CDB */
         free(conn->qe_version);
 
@@ -4368,41 +4363,12 @@ PQoptions(const PGconn *conn)
 }
 
 /* GPDB function to retrieve QE-backend details (motion listener) */
-int	PQgetQEdetail(PGconn *conn, bool alwaysFetch)
+int
+PQgetQEdetail(PGconn *conn)
 {
 	if (!conn || (PQstatus(conn) == CONNECTION_BAD))
 		return -1;
-	
-	/* return it immediately if we've already fetched it. */
-	if (!alwaysFetch && conn->motion_listener != 0)
-		return conn->motion_listener;
 
-	/* reset to 0 */
-	conn->motion_listener = 0;
-	
-	/* send a request to fetch the motion listener port. */
-	pqPacketSend(conn, 'W', NULL, 0 );
-
-	conn->asyncStatus = PGASYNC_BUSY;	
-	
-	/* wait for a response. */
-	if (PG_PROTOCOL_MAJOR(conn->pversion) >= 3)
-		pqParseInput3(conn);
-	else
-		return -1;
-	
-	while (conn->motion_listener == 0)
-	{
-		pqWait(TRUE, FALSE, conn);
-		if (pqReadData(conn) < 0)
-			return -1;
-		
-		if (PG_PROTOCOL_MAJOR(conn->pversion) >= 3)
-			pqParseInput3(conn);
-		else
-			return -1;
-	}
-	
 	return conn->motion_listener;
 }
 

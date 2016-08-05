@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/float.c,v 1.148 2007/01/20 21:47:10 neilc Exp $
+ *	  $PostgreSQL: pgsql/src/backend/utils/adt/float.c,v 1.153.2.1 2009/03/04 22:08:28 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -23,6 +23,7 @@
 #include "libpq/pqformat.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/float_utils.h"
 
 
 #ifndef M_PI
@@ -42,23 +43,6 @@ static const uint32 nan[2] = {0xffffffff, 0x7fffffff};
 /* not sure what the following should be, but better to make it over-sufficient */
 #define MAXFLOATWIDTH	64
 #define MAXDOUBLEWIDTH	128
-
-/*
- * check to see if a float4/8 val has underflowed or overflowed
- */
-#define CHECKFLOATVAL(val, inf_is_valid, zero_is_valid)			\
-do {															\
-	if (isinf(val) && !(inf_is_valid))							\
-		ereport(ERROR,											\
-				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),	\
-		  errmsg("value out of range: overflow")));				\
-																\
-	if ((val) == 0.0 && !(zero_is_valid))						\
-		ereport(ERROR,											\
-				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),	\
-		 errmsg("value out of range: underflow")));				\
-} while(0)
-
 
 /* ========== USER I/O ROUTINES ========== */
 
@@ -1230,108 +1214,6 @@ i2tof(PG_FUNCTION_ARGS)
 	int16		num = PG_GETARG_INT16(0);
 
 	PG_RETURN_FLOAT4((float4) num);
-}
-
-
-/*
- *		float8_text		- converts a float8 number to a text string
- */
-Datum
-float8_text(PG_FUNCTION_ARGS)
-{
-	float8		num = PG_GETARG_FLOAT8(0);
-	text	   *result;
-	int			len;
-	char	   *str;
-
-	str = DatumGetCString(DirectFunctionCall1(float8out,
-											  Float8GetDatum(num)));
-
-	len = strlen(str) + VARHDRSZ;
-
-	result = (text *) palloc(len);
-
-	SET_VARSIZE(result, len);
-	memcpy(VARDATA(result), str, (len - VARHDRSZ));
-
-	pfree(str);
-
-	PG_RETURN_TEXT_P(result);
-}
-
-
-/*
- *		text_float8		- converts a text string to a float8 number
- */
-Datum
-text_float8(PG_FUNCTION_ARGS)
-{
-	text	   *string = PG_GETARG_TEXT_P(0);
-	Datum		result;
-	int			len;
-	char	   *str;
-
-	len = (VARSIZE(string) - VARHDRSZ);
-	str = palloc(len + 1);
-	memcpy(str, VARDATA(string), len);
-	*(str + len) = '\0';
-
-	result = DirectFunctionCall1(float8in, CStringGetDatum(str));
-
-	pfree(str);
-
-	PG_RETURN_DATUM(result);
-}
-
-
-/*
- *		float4_text		- converts a float4 number to a text string
- */
-Datum
-float4_text(PG_FUNCTION_ARGS)
-{
-	float4		num = PG_GETARG_FLOAT4(0);
-	text	   *result;
-	int			len;
-	char	   *str;
-
-	str = DatumGetCString(DirectFunctionCall1(float4out,
-											  Float4GetDatum(num)));
-
-	len = strlen(str) + VARHDRSZ;
-
-	result = (text *) palloc(len);
-
-	SET_VARSIZE(result, len);
-	memcpy(VARDATA(result), str, (len - VARHDRSZ));
-
-	pfree(str);
-
-	PG_RETURN_TEXT_P(result);
-}
-
-
-/*
- *		text_float4		- converts a text string to a float4 number
- */
-Datum
-text_float4(PG_FUNCTION_ARGS)
-{
-	text	   *string = PG_GETARG_TEXT_P(0);
-	Datum		result;
-	int			len;
-	char	   *str;
-
-	len = (VARSIZE(string) - VARHDRSZ);
-	str = palloc(len + 1);
-	memcpy(str, VARDATA(string), len);
-	*(str + len) = '\0';
-
-	result = DirectFunctionCall1(float4in, CStringGetDatum(str));
-
-	pfree(str);
-
-	PG_RETURN_DATUM(result);
 }
 
 /*
@@ -3159,4 +3041,3 @@ float8_regr_amalg(PG_FUNCTION_ARGS)
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
 }
-

@@ -20,7 +20,7 @@ create table qp_misc_jiras.tbl1318(dummy integer, aa text not null);
 create index concurrently a_daa on qp_misc_jiras.tbl1318(dummy,aa);
 alter table qp_misc_jiras.tbl1318 alter column aa type integer using  bit_length(aa);
 drop index qp_misc_jiras.tbl1318_daa;
-alter table qp_misc_jiras.tbl1318 alter column aa type integer using  bit_length(aa);
+alter table qp_misc_jiras.tbl1318 alter column aa type integer using  bit_length(aa::text);
 drop table qp_misc_jiras.tbl1318;
 
 create table qp_misc_jiras.tbl1318(dummy integer, aa text not null);
@@ -487,16 +487,6 @@ select count(*) from qp_misc_jiras.tbl5028_part_test_1_prt_p1;
 select count(*) from qp_misc_jiras.tbl5028_part_test_1_prt_p2;
 select count(*) from qp_misc_jiras.tbl5028_part_test_1_prt_p3;
 
-create table qp_misc_jiras.tbl5028_delete_as_truncate (a int, b date,c text)
-partition by range(b)
-(
-        partition p1 start('2007-01-01'),
-        partition p2 start('2008-01-01'),
-        partition p3 start('2009-01-01'),
-        default partition def_part
-);
-insert into qp_misc_jiras.tbl5028_delete_as_truncate select * from qp_misc_jiras.tbl5028_part_test;
-
 DELETE FROM qp_misc_jiras.tbl5028_part_test where b >= '2007-01-01' and b <= '2007-03-01';
 
 select count(*) from qp_misc_jiras.tbl5028_part_test; -- should be 45
@@ -505,17 +495,6 @@ select count(*) from qp_misc_jiras.tbl5028_part_test_1_prt_def_part ; -- should 
 select count(*) from qp_misc_jiras.tbl5028_part_test_1_prt_p1; -- should be 9
 select count(*) from qp_misc_jiras.tbl5028_part_test_1_prt_p2; -- should be 12
 select count(*) from qp_misc_jiras.tbl5028_part_test_1_prt_p3; -- should be 12
-set gp_enable_delete_as_truncate=on;
-
-DELETE FROM qp_misc_jiras.tbl5028_delete_as_truncate where b >= '2007-01-01' and b <= '2007-03-01';
-
-select count(*) from qp_misc_jiras.tbl5028_delete_as_truncate; --should be 45
-select count(*) from qp_misc_jiras.tbl5028_delete_as_truncate_1_prt_def_part ; -- should be 12
-select count(*) from qp_misc_jiras.tbl5028_delete_as_truncate_1_prt_p1; -- should be 9
-select count(*) from qp_misc_jiras.tbl5028_delete_as_truncate_1_prt_p2; -- should be 12
-select count(*) from qp_misc_jiras.tbl5028_delete_as_truncate_1_prt_p3; -- should be 12
-
-drop table qp_misc_jiras.tbl5028_delete_as_truncate;
 drop table qp_misc_jiras.tbl5028_part_test;
 -- start_ignore
 --   MPP-11125: partition p1 start('0') end('25') every 8 (12)
@@ -556,138 +535,6 @@ create table qp_misc_jiras.tbl5219_test (i int, j int);
 insert into qp_misc_jiras.tbl5219_test select i, i%10 from generate_series(0, 99) i;
 select case when 1=2 then rank() over(partition by j order by i) end from qp_misc_jiras.tbl5219_test;
 drop table qp_misc_jiras.tbl5219_test;
--- start_ignore
-create language plpgsql;
--- end_ignore
-DROP TYPE IF EXISTS qp_misc_jiras.tbl4958_percent_cont_type CASCADE;
-CREATE TYPE qp_misc_jiras.tbl4958_percent_cont_type AS (
-        rn real,
-        frn integer,
-        crn integer,
-        frn_val numeric,
-        crn_val numeric
-);
-
-CREATE OR REPLACE FUNCTION qp_misc_jiras.tbl4958_percent_cont_sfunc_p( state qp_misc_jiras.tbl4958_percent_cont_type, percentile real, val numeric, rank bigint, count bigint  )
-        RETURNS qp_misc_jiras.tbl4958_percent_cont_type
-AS $$
-BEGIN
-        IF state.rn = 0 THEN
-                state.rn := 1 + ( percentile * ( count - 1 ) );
-        END IF;
-
-        IF rank = floor( state.rn ) THEN
-                state.frn := rank;
-                state.frn_val := val;
-        END IF;
-
-        IF rank = ceil( state.rn ) THEN
-                state.crn := rank;
-                state.crn_val := val;
-        END IF;
-
-        RETURN state;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION qp_misc_jiras.tbl4958_percent_cont_ffunc_p( state qp_misc_jiras.tbl4958_percent_cont_type )
-        RETURNS numeric
-AS $$
-DECLARE
-        v1 real;
-        v2 real;
-BEGIN
-        IF state.crn = state.frn AND state.crn = state.rn THEN
-                RETURN state.frn_val;
-        END IF;
-
-        v1 := ( state.crn - state.rn ) * state.frn_val;
-        v2 := ( state.rn - state.frn ) * state.crn_val;
-
-        RETURN v1 + v2;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP AGGREGATE IF EXISTS qp_misc_jiras.tbl4958_percent_cont( real, numeric, bigint, bigint );
-CREATE AGGREGATE qp_misc_jiras.tbl4958_percent_cont( real, numeric, bigint, bigint ) (
-        sfunc = qp_misc_jiras.tbl4958_percent_cont_sfunc_p,
-        stype = qp_misc_jiras.tbl4958_percent_cont_type,
-        finalfunc = qp_misc_jiras.tbl4958_percent_cont_ffunc_p,
-        initcond = '( 0, 0, 0, 0, 0 )'
-);
-
-drop table if exists qp_misc_jiras.tbl4958_test;
-create table qp_misc_jiras.tbl4958_test (i int, j int, k int);
-insert into qp_misc_jiras.tbl4958_test select i, i%36, i%109 from generate_series(0, 999999) i;
--- start_ignore
-select qp_misc_jiras.tbl4958_percent_cont(0.90, i::numeric, j, k) from qp_misc_jiras.tbl4958_test;
--- end_ignore
-
-drop table qp_misc_jiras.tbl4958_test;
-drop aggregate qp_misc_jiras.tbl4958_percent_cont(real, numeric, bigint, bigint);
-drop type qp_misc_jiras.tbl4958_percent_cont_type cascade;
-
-DROP TYPE IF EXISTS qp_misc_jiras.tbl4958_percent_cont_type CASCADE;
-CREATE TYPE qp_misc_jiras.tbl4958_percent_cont_type AS (
-        rn real,
-        frn integer,
-        crn integer,
-        frn_val numeric,
-        crn_val numeric
-);
-
-
-
-
-
-CREATE OR REPLACE FUNCTION qp_misc_jiras.tbl4958_percent_cont_sfunc_p( state qp_misc_jiras.tbl4958_percent_cont_type, percentile real, val numeric, rank bigint, count bigint  )
-        RETURNS qp_misc_jiras.tbl4958_percent_cont_type
-AS $$
-        select case when ($1.rn = 0 and $4 != floor ($1.rn) and $4 != ceil ($1.rn))
-                        then (1 + ( $2 * ( $5 - 1 ) ), $1.frn, $1.crn, $1.frn_val, $1.crn_val)::qp_misc_jiras.tbl4958_percent_cont_type
-                    when $1.rn = 0 and $4 != floor($1.rn) and $4 = ceil($1.rn)
-                        then (1 + ( $2 * ( $5 - 1 ) ), $1.frn, $4, $1.frn_val, $3)::qp_misc_jiras.tbl4958_percent_cont_type
-                    when $1.rn = 0 and $4 = floor($1.rn) and $4 != ceil($1.rn)
-                        then (1 + ( $2 * ( $5 - 1 ) ), $4, $1.crn, $3, $1.crn_val)::qp_misc_jiras.tbl4958_percent_cont_type
-                    when $1.rn = 0 and $4 = floor($1.rn) and $4 = ceil($1.rn)
-                        then (1 + ( $2 * ( $5 - 1 ) ), $4, $4, $3, $3)::qp_misc_jiras.tbl4958_percent_cont_type
-                    when $1.rn != 0 and $4 != floor($1.rn) and $4 = ceil($1.rn)
-                        then ($1.rn, $1.frn, $4, $1.frn_val, $3)::qp_misc_jiras.tbl4958_percent_cont_type
-                    when $1.rn != 0 and $4 = floor($1.rn) and $4 != ceil($1.rn)
-                        then ($1.rn, $4, $1.crn, $3, $1.crn_val)::qp_misc_jiras.tbl4958_percent_cont_type
-                    when $1.rn != 0 and $4 = floor($1.rn) and $4 = ceil($1.rn)
-                        then ($1.rn, $4, $4, $3, $3)::qp_misc_jiras.tbl4958_percent_cont_type
-                    else
-                        $1
-               end;
-$$ LANGUAGE SQL;
-
-CREATE OR REPLACE FUNCTION qp_misc_jiras.tbl4958_percent_cont_ffunc_p( state qp_misc_jiras.tbl4958_percent_cont_type )
-        RETURNS numeric
-AS $$
-        select case when $1.crn = $1.frn and $1.crn = $1.rn then $1.frn_val
-                    else (($1.crn - $1.rn ) * $1.frn_val + ($1.rn - $1.frn) * $1.crn_val)::numeric
-                    end;
-$$ LANGUAGE SQL;
-
-DROP AGGREGATE IF EXISTS qp_misc_jiras.tbl4958_percent_cont( real, numeric, bigint, bigint );
-CREATE AGGREGATE qp_misc_jiras.tbl4958_percent_cont( real, numeric, bigint, bigint ) (
-        sfunc = qp_misc_jiras.tbl4958_percent_cont_sfunc_p,
-        stype = qp_misc_jiras.tbl4958_percent_cont_type,
-        finalfunc = qp_misc_jiras.tbl4958_percent_cont_ffunc_p,
-        initcond = '( 0, 0, 0, 0, 0 )'
-);
-
-drop table if exists qp_misc_jiras.tbl4958_test;
-create table qp_misc_jiras.tbl4958_test (i int, j int, k int);
-insert into qp_misc_jiras.tbl4958_test select i, i%36, i%109 from generate_series(0, 999999) i;
--- start_ignore
-select qp_misc_jiras.tbl4958_percent_cont(0.90, i::numeric, j, k) from qp_misc_jiras.tbl4958_test;
--- end_ignore
-
-drop table qp_misc_jiras.tbl4958_test;
-drop aggregate qp_misc_jiras.tbl4958_percent_cont(real,numeric,bigint,bigint);
-drop type qp_misc_jiras.tbl4958_percent_cont_type cascade;
 select n
 from ( select row_number() over (partition by x) from (values (0)) as t(x) ) as r(n)
 group by n;
@@ -979,8 +826,8 @@ END ('2009-06-30 00:00:00'::timestamp without time zone) EVERY ('1 day'::interva
 );
 
 insert into qp_misc_jiras.tbl6419_test values( 123, '2009-06-01', 12, '2009-06-01 01:01:01', 'aaaaaa');
-select * from qp_misc_jiras.tbl6419_test where icedt = (select partitionrangestart FROM pg_partitions where tablename='test1' and schemaname='public' and partitionrank=1);
-select * from qp_misc_jiras.tbl6419_test where '2009-12-12'::date = (select 'test'::text);
+select * from qp_misc_jiras.tbl6419_test where icedt::text = (select partitionrangestart FROM pg_partitions where tablename='test1' and schemaname='public' and partitionrank=1);
+select * from qp_misc_jiras.tbl6419_test where '2009-12-12'::date::text = (select 'test'::text);
 drop table qp_misc_jiras.tbl6419_test;
 
 -- start_matchsubs
@@ -1205,7 +1052,7 @@ WHERE T.SQ = 1
 
 drop table qp_misc_jiras.ins_cr_nds_dt, qp_misc_jiras.ins_cr_nds_mstr, qp_misc_jiras.m_ccr_cvr_nds_t99, qp_misc_jiras.m_ccr_mthy_cr_nds_t00;
 
-reset gp_select_invisible;
+set gp_select_invisible=false;
 
 create table qp_misc_jiras.tbl6448 (x "char");
 insert into qp_misc_jiras.tbl6448 values ('a');
@@ -1477,6 +1324,7 @@ prepare prestmt as select * from statement_timeout_test s1, statement_timeout_te
 set statement_timeout = 1000; -- 1 sec
 execute prestmt; -- should get cancelled automatically
 drop table statement_timeout_test;
+reset statement_timeout;
 set gp_autostats_mode=none;
 drop table qp_misc_jiras.tbl_6934;
 create table qp_misc_jiras.tbl_6934(x inet);
@@ -2301,20 +2149,14 @@ drop table qp_misc_jiras.bar_6325;
 DROP TABLE qp_misc_jiras.abc_tbl8621;
 -- end_ignore
 
-CREATE TABLE qp_misc_jiras.abc_tbl8621 (a int, b int) WITH (appendonly=true, orientation=column);
-INSERT INTO qp_misc_jiras.abc_tbl8621 select generate_series(1,1000);
-INSERT INTO qp_misc_jiras.abc_tbl8621 select generate_series(1,1000);
-alter table qp_misc_jiras.abc_tbl8621 set distributed randomly;
-alter table qp_misc_jiras.abc_tbl8621 set distributed by (a);
-create index abc_idx on qp_misc_jiras.abc_tbl8621 using bitmap (a);
-insert into qp_misc_jiras.abc_tbl8621 select i, i+1 from generate_series(1, 2000000)i;
-insert into qp_misc_jiras.abc_tbl8621 select i % 100, (i+1) % 100 from generate_series(1,20*1000*1000) i;
+create table qp_misc_jiras.abc_tbl8621 (a int, b int) with (appendonly=true, orientation=column) distributed by (a);
+create index abc_idx on qp_misc_jiras.abc_tbl8621 using bitmap(b);
+insert into qp_misc_jiras.abc_tbl8621 select 1, i from generate_series(1,100000)i;
+insert into qp_misc_jiras.abc_tbl8621 select 1, i from generate_series(1,100000)i;
 
 -- start_ignore
 DROP TABLE qp_misc_jiras.abc_tbl8621;
 -- end_ignore
-
-
 
 -- start_ignore
 drop table if exists qp_misc_jiras.tbl8860_1;
@@ -2478,19 +2320,6 @@ insert into qp_misc_jiras.tbl9706aoc select i from generate_series(1, 100) i;
 
 select * from pg_catalog.get_ao_distribution('qp_misc_jiras.tbl9706ao'::regclass) order by 1 limit 2;
 select * from pg_catalog.get_ao_distribution('qp_misc_jiras.tbl9706aoc'::regclass) order by 1 limit 2;
-create table qp_misc_jiras.test_1 (a int, b int, c int) with (appendonly=true, orientation=column,compresslevel=0,blocksize=32768,checksum=false);
-insert into qp_misc_jiras.test_1 values (1,1,2);
-insert into qp_misc_jiras.test_1 values (1,1,3);
-insert into qp_misc_jiras.test_1 values (1,1,4);
-select count(*) from qp_misc_jiras.test_1;
-set Debug_column_store_use_new_segment_filename_format=on;
-select count(*) from qp_misc_jiras.test_1;
-set Debug_column_store_use_new_segment_filename_format=off;
-alter table qp_misc_jiras.test_1 set distributed by (c);
-set Debug_column_store_use_new_segment_filename_format=off;
-set Debug_column_store_use_new_segment_filename_format=on;
-select count(*) from qp_misc_jiras.test_1;
-drop table qp_misc_jiras.test_1;
 create table qp_misc_jiras.bmap2 (a varchar, b varchar);
 insert into qp_misc_jiras.bmap2 values ('1', NULL);
 create index bmap2_index on qp_misc_jiras.bmap2 using bitmap (a, b);
@@ -2509,52 +2338,9 @@ drop index qp_misc_jiras.bmap2_index;
 drop table qp_misc_jiras.badbitmapindex;
 drop table qp_misc_jiras.bmap2;
 
-
-CREATE TABLE qp_misc_jiras.execution_table (
- id integer,
- status integer,
- execution_id integer
-)
-DISTRIBUTED BY (id);
-
-INSERT INTO qp_misc_jiras.execution_table SELECT * from generate_series(1, 1000000) i;
-
-CREATE TABLE qp_misc_jiras.execution_t2 AS
-SELECT id, execution_id, status FROM qp_misc_jiras.execution_table
-DISTRIBUTED BY (id);
-
-CREATE INDEX status_idx ON qp_misc_jiras.execution_table USING bitmap (status);
-
-SELECT status, count(*) FROM qp_misc_jiras.execution_table WHERE status = 1 group by status; -- correct: one line
-
-UPDATE qp_misc_jiras.execution_table SET EXECUTION_ID = execution_t2.EXECUTION_ID FROM qp_misc_jiras.execution_t2 WHERE execution_table.id = execution_t2.id;
-
-SELECT status, count(*) FROM qp_misc_jiras.execution_table WHERE status = 1 group by status; -- correct: one line
-Alter table qp_misc_jiras.execution_table set distributed by (status, execution_id);
-Alter table qp_misc_jiras.execution_table set distributed by (status);
-
-VACUUM FULL qp_misc_jiras.execution_table; -- test VACUUM FULL, gives wrong results before the fix
-Alter table qp_misc_jiras.execution_table set distributed by (status);
-Alter table qp_misc_jiras.execution_t2 set distributed by (execution_id);
-Alter table qp_misc_jiras.execution_table set distributed by (status, execution_id);
-Alter table qp_misc_jiras.execution_table set distributed by (execution_id);
-Alter table qp_misc_jiras.execution_table set distributed by (id,execution_id);
-
-
-SELECT status, count(*) FROM qp_misc_jiras.execution_table WHERE status = 1 group by status;
-set statement_timeout=60;
-
-Create index id_idx on qp_misc_jiras.execution_table using bitmap (id, execution_id);
-set statement_timeout=0;
-Create table qp_misc_jiras.abc_tbl9083 (a int, b int);
-set statement_timeout=20;
-DROP TABLE qp_misc_jiras.abc_tbl9083;
-set statement_timeout=0;
-
-DROP TABLE qp_misc_jiras.execution_table;
-DROP TABLE qp_misc_jiras.execution_t2;
-
-
+-- temporally ignore and will be sovled by
+--   https://www.pivotaltracker.com/story/show/116312671
+-- start_ignore
 CREATE TABLE qp_misc_jiras.ir_voice_sms_and_data (
     imsi_number character varying(35),
     ir_call_country_name character varying(35),
@@ -2580,6 +2366,7 @@ case when ir_call_type_group_code in ('H', 'VH', 'PCB') then 'Thailland'
 else 'Unidentify' end
 ;
 DROP TABLE qp_misc_jiras.ir_voice_sms_and_data;
+-- end_ignore 
 -- start_ignore
 drop table if exists qp_misc_jiras.x cascade;
 drop table if exists qp_misc_jiras.r cascade;
@@ -2980,9 +2767,9 @@ insert into qp_misc_jiras.tbl13491_h values (1, lpad('a', 100000, 'b'));
 create table qp_misc_jiras.tbl13491_aocol with (appendonly=true, orientation=column) as select * from qp_misc_jiras.tbl13491_h distributed by (a);
 truncate table qp_misc_jiras.tbl13491_h;
 \t off
-select * from qp_misc_jiras.tbl13491_aocol;
+select str = lpad('a', 100000, 'b') from qp_misc_jiras.tbl13491_aocol;
 drop table qp_misc_jiras.tbl13491_h;
-select * from qp_misc_jiras.tbl13491_aocol;
+select str = lpad('a', 100000, 'b') from qp_misc_jiras.tbl13491_aocol;
 drop table qp_misc_jiras.tbl13491_aocol;
 -- start_ignore
 drop function if exists test();

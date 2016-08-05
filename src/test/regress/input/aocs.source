@@ -9,7 +9,7 @@ declare
 begin
 
   execute 'select relname from pg_class where oid=(select segrelid from pg_class, pg_appendonly where relname=''' || relname || ''' and relid = pg_class.oid)' into aosegname;
-  if aosegname > 0 then
+  if aosegname is not null then
 	  execute 'select tupcount from pg_aoseg.' || aosegname into tupcount;
   end if;
   return tupcount;
@@ -358,6 +358,12 @@ select * from co where j = 2;
 select i from co where j = 2;
 select j,i from co where k = 'aaa' or k = 'bbb';
 
+-- small test on a performance bug in bitmap indexes due to large tid gaps
+insert into co select i, 0, 'aaaaaaa' from generate_series(1, 20) i;
+insert into co select i, 1, 'aaa' from generate_series(1, 20) i;
+insert into co select i, 2, 'a' from generate_series(1, 20) i;
+select distinct j from co where j > -1 and j < 3 order by j;
+
 -- Test clustering errors out
 cluster co_j_cluster on co_j;
 
@@ -403,8 +409,13 @@ commit;
 select count(*) from tenk_aocs5_temp_pres_rows;
 
 -- RULES
-create rule aocs_rule_update as on insert to tenk_aocs5 do instead update foo_aocs set two=2;
-create rule aocs_rule_delete as on insert to tenk_aocs5 do instead delete from foo_aocs where unique1=1;
+insert into tenk_aocs5(unique1, unique2) values (1, 99998889);
+create rule ao_rule_update as on insert to tenk_aocs5 do instead update tenk_aocs5 set two=2;
+insert into tenk_aocs5(unique1, unique2) values (2, 99998889);
+select distinct two from tenk_aocs5;
+create rule ao_rule_delete as on update to tenk_aocs5 do instead delete from tenk_aocs5 where unique1=1;
+insert into tenk_aocs5(unique1, unique2) values (3, 99998889); -- should go through both rules
+select * from tenk_aocs5 where unique1=1;
 
 ---------------------
 -- UAO
@@ -488,7 +499,8 @@ insert into aocs_compress_results values (pg_relation_size('aocs_compress_table'
 insert into aocs_compress_table (id, v) values (1, 'ifyouwantto99knowwhatist8329histhenkeepreadingit;;untilyou]findoutyoureyeshurtandyoustil0ldontknow103kwhatitisdoyouunderstandmeyetandifyoustillwanttoknowthenyoupleasekeepreading');
 insert into aocs_compress_results values (pg_relation_size('aocs_compress_table'), pg_relation_size('aocs_compress_id_index'), pg_relation_size('aocs_compress_v_index'));
 
-select get_ao_compression_ratio('aocs_compress_table');
+-- compression ratio should be between 1.2 and 1.3
+select get_ao_compression_ratio('aocs_compress_table') > 1.2 and get_ao_compression_ratio('aocs_compress_table') < 1.3;
 select get_ao_distribution('aocs_compress_table');
 
 truncate table aocs_compress_table; -- after truncate, reclaim space from the table and index

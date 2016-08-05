@@ -1,0 +1,5 @@
+
+# GPDB-specific tests
+
+test: ao-serializable-read
+test: ao-serializable-vacuum

@@ -431,7 +431,7 @@ StreamServerPort(int family, char *hostName, unsigned short portNumber,
 		}
 #endif
 
-#ifdef IPV6_V6ONLY
+#if defined(IPV6_V6ONLY) && defined(IPPROTO_IPV6)
 		if (addr->ai_family == AF_INET6)
 		{
 			if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
@@ -524,6 +524,14 @@ static int
 Lock_AF_UNIX(unsigned short portNumber, char *unixSocketName)
 {
 	UNIXSOCK_PATH(sock_path, portNumber, unixSocketName);
+	if (strlen(sock_path) >= UNIXSOCK_PATH_BUFLEN)
+	{
+		ereport(LOG,
+				(errmsg("Unix-domain socket path \"%s\" is too long (maximum %d bytes)",
+						sock_path,
+						(int) (UNIXSOCK_PATH_BUFLEN - 1))));
+		return STATUS_ERROR;
+	}
 
 	/*
 	 * Grab an interlock file associated with the socket file.
@@ -1373,7 +1381,7 @@ pq_flush(void)
 {
 	int			res;
 
-	if ((Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_DISPATCHAGENT) && IsUnderPostmaster)
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
 	{
 		if (!pq_send_mutex_lock())
 		{
@@ -1383,7 +1391,7 @@ pq_flush(void)
 	pq_set_nonblocking(false);
 	res = internal_flush();
 
-	if ((Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_DISPATCHAGENT) && IsUnderPostmaster)
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
 		pthread_mutex_unlock(&send_mutex);
 	return res;
 }
@@ -1481,7 +1489,7 @@ pq_flush_if_writable(void)
 	/* Quick exit if nothing to do */
 	if (PqSendPointer == PqSendStart)
 		return 0;
-	if ((Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_DISPATCHAGENT) && IsUnderPostmaster)
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
 	{
 		if (!pq_send_mutex_lock())
 		{
@@ -1492,7 +1500,7 @@ pq_flush_if_writable(void)
 	pq_set_nonblocking(true);
 
 	res = internal_flush();
-	if ((Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_DISPATCHAGENT) && IsUnderPostmaster)
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
 		pthread_mutex_unlock(&send_mutex);
 	return res;
 }
@@ -1546,7 +1554,7 @@ pq_putmessage(char msgtype, const char *s, size_t len)
 		return EOF;
 	}
 
-	if ((Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_DISPATCHAGENT) && IsUnderPostmaster)
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
 	{
 		if (!pq_send_mutex_lock())
 		{
@@ -1572,13 +1580,13 @@ pq_putmessage(char msgtype, const char *s, size_t len)
 	if (internal_putbytes(s, len))
 		goto fail;
 
-	if ((Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_DISPATCHAGENT) && IsUnderPostmaster)
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
 		pthread_mutex_unlock(&send_mutex);
 
 	return 0;
 
 fail:
-	if ((Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_DISPATCHAGENT) && IsUnderPostmaster)
+	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
 		pthread_mutex_unlock(&send_mutex);
 
 	return EOF;

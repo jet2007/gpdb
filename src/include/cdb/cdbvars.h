@@ -111,7 +111,6 @@ typedef enum
 	GP_ROLE_UTILITY = 0,		/* Operating as a simple database engine */
 	GP_ROLE_DISPATCH,			/* Operating as the parallel query dispatcher */
 	GP_ROLE_EXECUTE,			/* Operating as a parallel query executor */
-	GP_ROLE_DISPATCHAGENT,		/* A dispatch relay agent */
 	GP_ROLE_UNDEFINED			/* Should never see this role in use */
 } GpRoleValue;
 
@@ -157,29 +156,6 @@ extern char * qdHostname;
 
 /* The Postmaster listener port for the QD.  This variable is 0 for the QD itself.*/
 extern int qdPostmasterPort;
-
-
-/* Parameter gp_qd_callback_info
- *
- * This is the port of the QD, sent down to the QEs
- */
-
-extern char * gp_qd_callback_info;
-extern bool gp_use_snapshop_during_callback;
-
-/*
- * Allow callback query?
- */
-extern bool gp_enable_functions;
-/*
- * Are we executing a callback query?
- */
-extern bool gp_is_callback;
-
-/*
- * Use query dispatch agents?
- */
-extern bool gp_use_dispatch_agent;
 
 /*How many gangs to keep around from stmt to stmt.*/
 extern int			gp_cached_gang_threshold;
@@ -234,11 +210,6 @@ extern bool           gp_enable_slow_writer_testmode;
  * it is very handy to slow down the cursor (opens important race-window).
  */
 extern bool           gp_enable_slow_cursor_testmode;
-
-/*
- * MPP-4145: convert certain delete statements into truncate statements.
- */
-extern bool           gp_enable_delete_as_truncate;
 
 /*
  * MPP-6926: Resource Queues on by default
@@ -432,7 +403,6 @@ extern char *gp_fault_action_string;	/* Use by guc.c as user defined fault
 										 * action */
 extern bool gp_set_read_only;
 
-extern bool assign_gp_use_dispatch_agent(bool newval, bool doit, GucSource source);
 extern const char *role_to_string(GpRoleValue role);
 
 extern int	gp_segment_connect_timeout; /* GUC var - timeout specifier for gang creation */
@@ -470,11 +440,7 @@ extern int	Gp_max_packet_size;	/* GUC var */
 /*
  * Support for multiple "types" of interconnect
  */
-
-#define INTERCONNECT_TYPE_TCP    (0)
-#define INTERCONNECT_TYPE_UDP    (1)
-#define INTERCONNECT_TYPE_UDPIFC (2)
-#define INTERCONNECT_TYPE_NIL    (3)
+#define INTERCONNECT_TYPE_UDPIFC (0)
 
 extern int Gp_interconnect_type;
 

@@ -5,7 +5,7 @@
  * Copyright (c) 2002-2008, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/adt/dbsize.c,v 1.9.2.1 2007/03/11 06:44:11 alvherre Exp $
+ *	  $PostgreSQL: pgsql/src/backend/utils/adt/dbsize.c,v 1.16.2.2 2010/01/23 21:29:12 tgl Exp $
  *
  */
 
@@ -23,6 +23,7 @@
 #include "catalog/catalog.h"
 #include "catalog/catquery.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_appendonly_fn.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/dbcommands.h"
 #include "commands/tablespace.h"
@@ -129,6 +130,8 @@ db_dir_size(const char *path)
 	{
 		struct stat fst;
 
+		CHECK_FOR_INTERRUPTS();
+
 		if (strcmp(direntry->d_name, ".") == 0 ||
 			strcmp(direntry->d_name, "..") == 0)
 			continue;
@@ -157,12 +160,12 @@ db_dir_size(const char *path)
 static int64
 calculate_database_size(Oid dbOid)
 {
-	int64		 totalsize = 0;
-	char		 pathname[MAXPGPATH];
-	Relation     rel;
+	int64		totalsize;
+	char		pathname[MAXPGPATH];
+	Relation    rel;
 	HeapScanDesc scandesc;
-	HeapTuple    tuple;
-	AclResult	 aclresult;
+	HeapTuple   tuple;
+	AclResult	aclresult;
 
 	/* User must have connect privilege for target database */
 	aclresult = pg_database_aclcheck(dbOid, GetUserId(), ACL_CONNECT);
@@ -174,6 +177,7 @@ calculate_database_size(Oid dbOid)
 	rel = heap_open(TableSpaceRelationId, AccessShareLock);
 	scandesc = heap_beginscan(rel, SnapshotNow, 0, NULL);
 	tuple = heap_getnext(scandesc, ForwardScanDirection);
+	totalsize = 0;
 	while (HeapTupleIsValid(tuple))
 	{
 		char *priFilespace, *mirFilespace;
@@ -303,6 +307,8 @@ calculate_tablespace_size(Oid tblspcOid)
 	while ((direntry = ReadDir(dirdesc, tblspcPath)) != NULL)
 	{
 		struct stat fst;
+
+		CHECK_FOR_INTERRUPTS();
 
 		if (strcmp(direntry->d_name, ".") == 0 ||
 			strcmp(direntry->d_name, "..") == 0)
@@ -599,7 +605,6 @@ calculate_total_relation_size(Oid Relid)
 {
 	Relation	heapRel;
 	Oid			toastOid;
-	AppendOnlyEntry *aoEntry = NULL;
 	int64		size;
 	ListCell   *cell;
 
@@ -609,9 +614,6 @@ calculate_total_relation_size(Oid Relid)
 		return 0;
 
 	toastOid = heapRel->rd_rel->reltoastrelid;
-
-	if (RelationIsAoRows(heapRel) || RelationIsAoCols(heapRel))
-		aoEntry = GetAppendOnlyEntry(Relid, SnapshotNow);
 	
 	/* Get the heap size */
 	if (Relid == 0 || heapRel->rd_node.relNode == 0)
@@ -646,24 +648,21 @@ calculate_total_relation_size(Oid Relid)
 	if (OidIsValid(toastOid))
 		size += calculate_total_relation_size(toastOid);
 
-	if (aoEntry != NULL)
+	if (RelationIsAoRows(heapRel) || RelationIsAoCols(heapRel))
 	{
-		Assert(OidIsValid(aoEntry->segrelid));
-		size += calculate_total_relation_size(aoEntry->segrelid);
+		Assert(OidIsValid(heapRel->rd_appendonly->segrelid));
+		size += calculate_total_relation_size(heapRel->rd_appendonly->segrelid);
 
         /* block directory may not exist, post upgrade or new table that never has indexes */
-   		if (OidIsValid(aoEntry->blkdirrelid))
+   		if (OidIsValid(heapRel->rd_appendonly->blkdirrelid))
         {
-     		size += calculate_total_relation_size(aoEntry->blkdirrelid);
+     		size += calculate_total_relation_size(heapRel->rd_appendonly->blkdirrelid);
         }
-		if (OidIsValid(aoEntry->visimaprelid))
+		if (OidIsValid(heapRel->rd_appendonly->visimaprelid))
 		{
-			size += calculate_total_relation_size(aoEntry->visimaprelid);
+			size += calculate_total_relation_size(heapRel->rd_appendonly->visimaprelid);
 		}
 	}
-
-	if (aoEntry != NULL)
-		pfree(aoEntry);
 
 	relation_close(heapRel, AccessShareLock);
 
@@ -775,33 +774,33 @@ pg_size_pretty(PG_FUNCTION_ARGS)
 	int64		size = PG_GETARG_INT64(0);
 	char	   *result = palloc(50 + VARHDRSZ);
 	int64		limit = 10 * 1024;
-	int64		mult = 1;
+	int64		limit2 = limit * 2 - 1;
 
-	if (size < limit * mult)
+	if (size < limit)
 		snprintf(VARDATA(result), 50, INT64_FORMAT " bytes", size);
 	else
 	{
-		mult *= 1024;
-		if (size < limit * mult)
+		size >>= 9;				/* keep one extra bit for rounding */
+		if (size < limit2)
 			snprintf(VARDATA(result), 50, INT64_FORMAT " kB",
-					 (size + mult / 2) / mult);
+					 (size + 1) / 2);
 		else
 		{
-			mult *= 1024;
-			if (size < limit * mult)
+			size >>= 10;
+			if (size < limit2)
 				snprintf(VARDATA(result), 50, INT64_FORMAT " MB",
-						 (size + mult / 2) / mult);
+						 (size + 1) / 2);
 			else
 			{
-				mult *= 1024;
-				if (size < limit * mult)
+				size >>= 10;
+				if (size < limit2)
 					snprintf(VARDATA(result), 50, INT64_FORMAT " GB",
-							 (size + mult / 2) / mult);
+							 (size + 1) / 2);
 				else
 				{
-					mult *= 1024;
+					size >>= 10;
 					snprintf(VARDATA(result), 50, INT64_FORMAT " TB",
-							 (size + mult / 2) / mult);
+							 (size + 1) / 2);
 				}
 			}
 		}

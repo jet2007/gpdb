@@ -92,6 +92,7 @@ typedef struct CdbComponentDatabases
 	int			my_dbid;		/* the dbid of this database */
 	int			my_segindex;	/* the content of this database */
 	bool		my_isprimary;	/* the isprimary flag of this database */
+	int		fts_version;	/* the version of fts */
 } CdbComponentDatabases;
 
 /*
@@ -171,5 +172,15 @@ extern int16 my_mirror_dbid(void);
  * thrown if Gp_role = utility.
  */
 extern int	getgpsegmentCount(void);
+
+extern bool isSockAlive(int sock);
+
+#define ELOG_DISPATCHER_DEBUG(...) do { \
+       if (gp_log_gang >= GPVARS_VERBOSITY_DEBUG) elog(LOG, __VA_ARGS__); \
+    } while(false);
+
+#define WRITE_LOG_DISPATCHER_DEBUG(...) do { \
+	if (gp_log_gang >= GPVARS_VERBOSITY_DEBUG) write_log(__VA_ARGS__); \
+    } while(false);
 
 #endif   /* CDBUTIL_H */

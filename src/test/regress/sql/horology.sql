@@ -8,8 +8,10 @@ INSERT INTO ABSTIME_HOROLOGY_TBL (f1) VALUES ('Jan 14, 1973 03:14:21'),
 (abstime 'epoch'),
 (abstime 'infinity'),
 (abstime '-infinity'),
-(abstime 'May 10, 1947 23:59:12'),
-('Jun 10, 1843');
+(abstime 'May 10, 1947 23:59:12');
+
+-- orca will fail for this
+INSERT INTO ABSTIME_HOROLOGY_TBL (f1) VALUES('Jun 10, 1843');
 
 CREATE TABLE INTERVAL_HOROLOGY_TBL (f1 interval);
 INSERT INTO INTERVAL_HOROLOGY_TBL (f1) VALUES ('@ 1 minute'),
@@ -356,19 +358,19 @@ SELECT CAST(CAST(date 'today' + time with time zone '05:30'
 SELECT CAST(cast(date 'today' + time with time zone '03:30'
   + interval '1 month 04:01' as timestamp without time zone) AS time) AS "07:31:00";
 
-SELECT t.d1 + i.f1 AS "102" FROM TIMESTAMP_HOROLOGY_TBL t, INTERVAL_HOROLOGY_TBL i
+SELECT t.d1 AS t, i.f1 AS i, t.d1 + i.f1 AS "add", t.d1 - i.f1 AS "subtract"
+  FROM TIMESTAMP_HOROLOGY_TBL t, INTERVAL_HOROLOGY_TBL i
   WHERE t.d1 BETWEEN '1990-01-01' AND '2001-01-01'
-    AND i.f1 BETWEEN '00:00' AND '23:00' ORDER BY 1;
+    AND i.f1 BETWEEN '00:00' AND '23:00'
+  ORDER BY 1,2;
 
-SELECT t.d1 - i.f1 AS "102" FROM TIMESTAMP_HOROLOGY_TBL t, INTERVAL_HOROLOGY_TBL i
-  WHERE t.d1 BETWEEN '1990-01-01' AND '2001-01-01'
-    AND i.f1 BETWEEN '00:00' AND '23:00' ORDER BY 1;
+SELECT t.f1 AS t, i.f1 AS i, t.f1 + i.f1 AS "add", t.f1 - i.f1 AS "subtract"
+  FROM TIME_HOROLOGY_TBL t, INTERVAL_HOROLOGY_TBL i
+  ORDER BY 1,2;
 
-SELECT t.f1 + i.f1 AS "80" FROM TIME_HOROLOGY_TBL t, INTERVAL_HOROLOGY_TBL i ORDER BY 1;
-SELECT t.f1 - i.f1 AS "80" FROM TIME_HOROLOGY_TBL t, INTERVAL_HOROLOGY_TBL i ORDER BY 1;
-
-SELECT t.f1 + i.f1 AS "100" FROM TIMETZ_HOROLOGY_TBL t, INTERVAL_HOROLOGY_TBL i ORDER BY 1;
-SELECT t.f1 - i.f1 AS "100" FROM TIMETZ_HOROLOGY_TBL t, INTERVAL_HOROLOGY_TBL i ORDER BY 1;
+SELECT t.f1 AS t, i.f1 AS i, t.f1 + i.f1 AS "add", t.f1 - i.f1 AS "subtract"
+  FROM TIMETZ_HOROLOGY_TBL t, INTERVAL_HOROLOGY_TBL i
+  ORDER BY 1,2;
 
 -- SQL9x OVERLAPS operator
 -- test with time zone

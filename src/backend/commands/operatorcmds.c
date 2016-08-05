@@ -9,7 +9,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/operatorcmds.c,v 1.35 2007/01/05 22:19:26 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/operatorcmds.c,v 1.39 2008/01/01 19:45:49 momjian Exp $
  *
  * DESCRIPTION
  *	  The "DefineFoo" routines take the parse tree and pick out the
@@ -50,7 +50,7 @@
 #include "utils/syscache.h"
 
 #include "cdb/cdbvars.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 
 static void AlterOperatorOwner_internal(Relation rel, Oid operOid, Oid newOwnerId);
 
@@ -63,13 +63,14 @@ static void AlterOperatorOwner_internal(Relation rel, Oid operOid, Oid newOwnerI
  * 'parameters' is a list of DefElem
  */
 void
-DefineOperator(List *names, List *parameters, Oid newOid)
+DefineOperator(List *names, List *parameters,
+			   Oid newOid, Oid newCommutatorOid, Oid newNegatorOid)
 {
 	char	   *oprName;
 	Oid			oprNamespace;
 	AclResult	aclresult;
 	bool		canMerge = false;		/* operator merges */
-	bool		canHash = false;		/* operator hashes */
+	bool		canHash = false;	/* operator hashes */
 	List	   *functionName = NIL;		/* function for operator */
 	TypeName   *typeName1 = NULL;		/* first type name */
 	TypeName   *typeName2 = NULL;		/* second type name */
@@ -104,7 +105,7 @@ DefineOperator(List *names, List *parameters, Oid newOid)
 			if (typeName1->setof)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-					errmsg("setof type not allowed for operator argument")));
+					errmsg("SETOF type not allowed for operator argument")));
 		}
 		else if (pg_strcasecmp(defel->defname, "rightarg") == 0)
 		{
@@ -112,7 +113,7 @@ DefineOperator(List *names, List *parameters, Oid newOid)
 			if (typeName2->setof)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-					errmsg("setof type not allowed for operator argument")));
+					errmsg("SETOF type not allowed for operator argument")));
 		}
 		else if (pg_strcasecmp(defel->defname, "procedure") == 0)
 			functionName = defGetQualifiedName(defel);
@@ -154,9 +155,9 @@ DefineOperator(List *names, List *parameters, Oid newOid)
 
 	/* Transform type names to type OIDs */
 	if (typeName1)
-		typeId1 = typenameTypeId(NULL, typeName1);
+		typeId1 = typenameTypeId(NULL, typeName1, NULL);
 	if (typeName2)
-		typeId2 = typenameTypeId(NULL, typeName2);
+		typeId2 = typenameTypeId(NULL, typeName2, NULL);
 
 	/*
 	 * now have OperatorCreate do all the work..
@@ -172,7 +173,9 @@ DefineOperator(List *names, List *parameters, Oid newOid)
 				   joinName,	/* optional join sel. procedure name */
 				   canMerge,	/* operator merges */
 				   canHash,	/* operator hashes */
-				   newOid);
+				   newOid,
+				   &newCommutatorOid,
+				   &newNegatorOid);
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
@@ -183,8 +186,14 @@ DefineOperator(List *names, List *parameters, Oid newOid)
 		stmt->args = NIL;
 		stmt->definition = parameters;
 		stmt->newOid = opOid;
-		stmt->shadowOid = 0;
-		CdbDispatchUtilityStatement((Node *) stmt, "DefineOperator");
+		stmt->commutatorOid = newCommutatorOid;
+		stmt->negatorOid = newNegatorOid;
+		stmt->arrayOid = InvalidOid;
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 }
 
@@ -247,7 +256,11 @@ RemoveOperator(RemoveFuncStmt *stmt)
 	
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "RemoveOperator");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 }
 

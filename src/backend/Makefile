@@ -5,7 +5,7 @@
 # Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
-# $PostgreSQL: pgsql/src/backend/Makefile,v 1.122 2007/02/09 15:55:57 petere Exp $
+# $PostgreSQL: pgsql/src/backend/Makefile,v 1.125 2008/01/01 19:45:45 momjian Exp $
 #
 #-------------------------------------------------------------------------
 
@@ -24,14 +24,17 @@ ifdef ADDON_DIR
 include $(BLD_TOP)/$(ADDON_DIR)/src/Makefile
 endif
 
-
 SUBDIRS = access bootstrap catalog parser commands executor \
 	fts lib libpq gp_libpq_fe main nodes optimizer port postmaster regex \
-	replication rewrite storage tcop utils $(top_builddir)/src/timezone cdb \
+	replication rewrite storage tcop tsearch utils $(top_builddir)/src/timezone cdb \
 	$(ADDON_SUBDIR)
 
 ifeq ($(enable_orca),yes)
 SUBDIRS += gpopt
+endif
+
+ifeq ($(enable_codegen),yes)
+SUBDIRS += codegen
 endif
 
 include $(srcdir)/common.mk
@@ -64,14 +67,23 @@ LIBS := $(filter-out -lpgport, $(LIBS)) $(LDAP_LIBS_BE) $(CONNECTEMCLIB)
 # The backend doesn't need everything that's in LIBS, however
 LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses, $(LIBS))
 
-# adding orca libraries
+# Add ORCA libraries
 ifeq ($(enable_orca),yes)
-LIBS := $(LIBS) -L$(LIBGPOS)/$(OBJDIR_DEFAULT) -lgpos
-LIBS := $(LIBS) -L$(XERCES_LIBDIR) -lxerces-c-3.1
-LIBS := $(LIBS) -L$(OPTIMIZER)/libnaucrates/$(OBJDIR_DEFAULT) -lnaucrates
-LIBS := $(LIBS) -L$(OPTIMIZER)/libgpdbcost/$(OBJDIR_DEFAULT) -lgpdbcost
-LIBS := $(LIBS) -L$(OPTIMIZER)/libgpopt/$(OBJDIR_DEFAULT) -lgpopt
-LIBS := $(LIBS) -L$(top_builddir)/src/backend/gpopt -ldxltranslators
+LIBS := $(LIBS) -L$(LIBGPOS)/$(OBJDIR_DEFAULT)
+LIBS := $(LIBS) -L$(OPTIMIZER)/libnaucrates/$(OBJDIR_DEFAULT)
+LIBS := $(LIBS) -L$(OPTIMIZER)/libgpdbcost/$(OBJDIR_DEFAULT)
+LIBS := $(LIBS) -L$(OPTIMIZER)/libgpopt/$(OBJDIR_DEFAULT)
+LIBS := $(LIBS) -L$(XERCES_LIBDIR)
+
+# The order of the libraries is significant, when building against static
+# ORCA libraries.
+LIBS := $(LIBS) -lgpopt -lnaucrates -lgpdbcost -lgpos
+LIBS := $(LIBS) -lxerces-c-3.1
+endif
+
+# adding codegen libraries
+ifeq ($(enable_codegen),yes)
+LIBS := $(LIBS) -L$(top_builddir)/src/backend/codegen -lgpcodegen
 endif
 
 # Greenplum uses threads in the backend
@@ -214,12 +226,16 @@ ifeq ($(MAKE_DLL), true)
 endif
 endif
 	$(MAKE) -C catalog install-data
+	$(MAKE) -C tsearch install-data
 	$(INSTALL_DATA) $(srcdir)/libpq/pg_hba.conf.sample '$(DESTDIR)$(datadir)/pg_hba.conf.sample'
 	$(INSTALL_DATA) $(srcdir)/libpq/pg_ident.conf.sample '$(DESTDIR)$(datadir)/pg_ident.conf.sample'
 	$(INSTALL_DATA) $(srcdir)/utils/misc/postgresql.conf.sample '$(DESTDIR)$(datadir)/postgresql.conf.sample'
 	$(INSTALL_DATA) $(srcdir)/access/transam/recovery.conf.sample '$(DESTDIR)$(datadir)/recovery.conf.sample'
 ifeq ($(enable_orca), yes)
 	$(MAKE) -C gpopt $@ INSTLOC=$(DESTDIR)$(libdir)
+endif
+ifeq ($(enable_codegen), yes)
+	$(MAKE) -C codegen $@ DESTDIR=$(DESTDIR)
 endif
 
 install-bin: postgres $(POSTGRES_IMP) installdirs
@@ -232,6 +248,7 @@ else
 endif
 ifeq ($(MAKE_EXPORTS), true)
 	$(INSTALL_DATA) $(POSTGRES_IMP) '$(DESTDIR)$(pkglibdir)/$(POSTGRES_IMP)'
+	$(INSTALL_PROGRAM) $(MKLDEXPORT) '$(DESTDIR)$(pgxsdir)/$(MKLDEXPORT_DIR)/mkldexport.sh'
 endif
 
 .PHONY: install-bin
@@ -250,6 +267,7 @@ endif
 endif
 ifeq ($(MAKE_EXPORTS), true)
 	$(MKDIR_P) '$(DESTDIR)$(pkglibdir)'
+	$(MKDIR_P) '$(DESTDIR)$(pgxsdir)/$(MKLDEXPORT_DIR)'
 endif
 
 
@@ -259,6 +277,7 @@ uninstall:
 	rm -f $(DESTDIR)$(bindir)/postgres$(X) $(DESTDIR)$(bindir)/postmaster $(DESTDIR)$(bindir)/cdbsyncmaster
 ifeq ($(MAKE_EXPORTS), true)
 	rm -f '$(DESTDIR)$(pkglibdir)/$(POSTGRES_IMP)'
+	rm -f '$(DESTDIR)$(pgxsdir)/$(MKLDEXPORT_DIR)/mkldexport.sh'
 endif
 ifeq ($(PORTNAME), cygwin)
 ifeq ($(MAKE_DLL), true)
@@ -271,6 +290,7 @@ ifeq ($(MAKE_DLL), true)
 endif
 endif
 	$(MAKE) -C catalog uninstall-data
+	$(MAKE) -C tsearch uninstall-data
 	rm -f '$(DESTDIR)$(datadir)/pg_hba.conf.sample' \
 	      '$(DESTDIR)$(datadir)/pg_ident.conf.sample' \
               '$(DESTDIR)$(datadir)/postgresql.conf.sample' \

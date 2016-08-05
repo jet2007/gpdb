@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/storage/lmgr/lock.c,v 1.176 2007/02/01 19:10:28 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/storage/lmgr/lock.c,v 1.181.2.2 2009/03/11 00:08:06 alvherre Exp $
  *
  * NOTES
  *	  A lock table is a shared memory hash table.  When
@@ -38,7 +38,6 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
-#include "storage/lmgr.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/testutils.h"
@@ -585,9 +584,9 @@ LockAcquire(const LOCKTAG *locktag,
 	
 	if (lockmethodid == DEFAULT_LOCKMETHOD && locktag->locktag_type != LOCKTAG_TRANSACTION)
 	{
-		if (Gp_role == GP_ROLE_EXECUTE && (gp_is_callback || !Gp_is_writer))
+		if (Gp_role == GP_ROLE_EXECUTE && !Gp_is_writer)
 		{	
-			if (lockHolderProcPtr == MyProc)
+			if (lockHolderProcPtr == NULL || lockHolderProcPtr == MyProc)
 			{
 				/* Find the guy who should manage our locks */
 				PGPROC * proc = FindProcByGpSessionId(gp_session_id);
@@ -605,14 +604,19 @@ LockAcquire(const LOCKTAG *locktag,
 					lockHolderProcPtr = proc;
 				}
 				else
-					elog(ERROR,"Could not find writer proc entry!");
+					elog(DEBUG1,"Could not find writer proc entry!");
 		
-				elog(DEBUG1,"Reader gang member trying to acquire a lock [%u,%u] %s %d",
+					elog(DEBUG1,"Reader gang member trying to acquire a lock [%u,%u] %s %d",
 						 locktag->locktag_field1, locktag->locktag_field2,
 						 lock_mode_names[lockmode], (int)locktag->locktag_type);
 			}
+				
 		}
 	}
+	
+	
+	
+	
 
 	/*
 	 * Otherwise we've got to mess with the shared lock table.
@@ -642,7 +646,7 @@ LockAcquire(const LOCKTAG *locktag,
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of shared memory"),
-			errhint("You might need to increase max_locks_per_transaction.")));
+		  errhint("You might need to increase max_locks_per_transaction.")));
 	}
 	locallock->lock = lock;
 
@@ -710,7 +714,7 @@ LockAcquire(const LOCKTAG *locktag,
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of shared memory"),
-			errhint("You might need to increase max_locks_per_transaction.")));
+		  errhint("You might need to increase max_locks_per_transaction.")));
 	}
 	locallock->proclock = proclock;
 
@@ -771,19 +775,6 @@ LockAcquire(const LOCKTAG *locktag,
 	}
 
 	/*
-	 * We shouldn't already hold the desired lock; else locallock table is
-	 * broken.
-	 */
-	if (proclock->holdMask & LOCKBIT_ON(lockmode))
-	{
-		LWLockRelease(partitionLock);
-		elog(ERROR, "lock %s on object %u/%u/%u is already held",
-			 lock_mode_names[lockmode],
-			 lock->tag.locktag_field1, lock->tag.locktag_field2,
-			 lock->tag.locktag_field3);
-	}
-
-	/*
 	 * lock->nRequested and lock->requested[] count the total number of
 	 * requests, whether granted or waiting, so increment those immediately.
 	 * The other counts don't increment till we get the lock.
@@ -791,7 +782,54 @@ LockAcquire(const LOCKTAG *locktag,
 	lock->nRequested++;
 	lock->requested[lockmode]++;
 	Assert((lock->nRequested > 0) && (lock->requested[lockmode] > 0));
-	
+
+	/*
+	 * We shouldn't already hold the desired lock; else locallock table is
+	 * broken.
+	 */
+	if (Gp_role != GP_ROLE_UTILITY)
+	{
+		if (proclock->holdMask & LOCKBIT_ON(lockmode))
+		{
+			elog(LOG, "lock %s on object %u/%u/%u is already held",
+				 lock_mode_names[lockmode],
+				 lock->tag.locktag_field1, lock->tag.locktag_field2,
+				 lock->tag.locktag_field3);
+			if (MyProc == lockHolderProcPtr)
+			{
+				elog(LOG, "writer found lock %s on object %u/%u/%u that it didn't know it held",
+						 lock_mode_names[lockmode],
+						 lock->tag.locktag_field1, lock->tag.locktag_field2,
+						 lock->tag.locktag_field3);
+				GrantLock(lock, proclock, lockmode);
+				GrantLockLocal(locallock, owner);
+			}
+			else
+			{
+				if (MyProc != lockHolderProcPtr)
+				{
+					elog(LOG, "reader found lock %s on object %u/%u/%u which is already held by writer",
+						 lock_mode_names[lockmode],
+						 lock->tag.locktag_field1, lock->tag.locktag_field2,
+						 lock->tag.locktag_field3);
+				}
+				lock->nRequested--;
+				lock->requested[lockmode]--;
+			}
+			LWLockRelease(partitionLock);
+			return LOCKACQUIRE_ALREADY_HELD;
+		}
+		
+	}
+	else
+	if (proclock->holdMask & LOCKBIT_ON(lockmode))
+	{
+		elog(LOG, "lock %s on object %u/%u/%u is already held",
+			 lockMethodTable->lockModeNames[lockmode],
+			 lock->tag.locktag_field1, lock->tag.locktag_field2,
+			 lock->tag.locktag_field3);
+		Insist(false);
+	}
 	/*
 	 * If lock requested conflicts with locks requested by waiters, must join
 	 * wait queue.	Otherwise, check for conflict with already-held locks.
@@ -1335,7 +1373,7 @@ WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner)
  * NB: this does not clean up any locallock object that may exist for the lock.
  */
 void
-RemoveFromWaitQueue(PGPROC *proc, uint32 hashcode, bool wakeupNeeded)
+RemoveFromWaitQueue(PGPROC *proc, uint32 hashcode)
 {
 	LOCK	   *waitLock = proc->waitLock;
 	PROCLOCK   *proclock = proc->waitProcLock;
@@ -1379,7 +1417,7 @@ RemoveFromWaitQueue(PGPROC *proc, uint32 hashcode, bool wakeupNeeded)
 	 */
 	CleanUpLock(waitLock, proclock,
 				LockMethods[lockmethodid], hashcode,
-				wakeupNeeded);
+				true);
 }
 
 /*
@@ -1838,20 +1876,24 @@ LockReassignCurrentOwner(void)
 
 /*
  * GetLockConflicts
- *		Get a list of TransactionIds of xacts currently holding locks
+ *		Get an array of VirtualTransactionIds of xacts currently holding locks
  *		that would conflict with the specified lock/lockmode.
  *		xacts merely awaiting such a lock are NOT reported.
+ *
+ * The result array is palloc'd and is terminated with an invalid VXID.
  *
  * Of course, the result could be out of date by the time it's returned,
  * so use of this function has to be thought about carefully.
  *
- * Only top-level XIDs are reported.  Note we never include the current xact
- * in the result list, since an xact never blocks itself.
+ * Note we never include the current xact's vxid in the result array,
+ * since an xact never blocks itself.  Also, prepared transactions are
+ * ignored, which is a bit more debatable but is appropriate for current
+ * uses of the result.
  */
-List *
+VirtualTransactionId *
 GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode)
 {
-	List	   *result = NIL;
+	VirtualTransactionId *vxids;
 	LOCKMETHODID lockmethodid = locktag->locktag_lockmethodid;
 	LockMethod	lockMethodTable;
 	LOCK	   *lock;
@@ -1860,12 +1902,21 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode)
 	PROCLOCK   *proclock;
 	uint32		hashcode;
 	LWLockId	partitionLock;
+	int			count = 0;
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
 	lockMethodTable = LockMethods[lockmethodid];
 	if (lockmode <= 0 || lockmode > lockMethodTable->numLockModes)
 		elog(ERROR, "unrecognized lock mode: %d", lockmode);
+
+	/*
+	 * Allocate memory to store results, and fill with InvalidVXID.  We only
+	 * need enough space for MaxBackends + a terminator, since prepared xacts
+	 * don't count.
+	 */
+	vxids = (VirtualTransactionId *)
+		palloc0(sizeof(VirtualTransactionId) * (MaxBackends + 1));
 
 	/*
 	 * Look up the lock object matching the tag.
@@ -1887,7 +1938,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode)
 		 * on this lockable object.
 		 */
 		LWLockRelease(partitionLock);
-		return NIL;
+		return vxids;
 	}
 
 	/*
@@ -1909,18 +1960,17 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode)
 			/* A backend never blocks itself */
 			if (proc != MyProc)
 			{
-				/* Fetch xid just once - see GetNewTransactionId */
-				TransactionId xid = proc->xid;
+				VirtualTransactionId vxid;
+
+				GET_VXID_FROM_PGPROC(vxid, *proc);
 
 				/*
-				 * Race condition: during xact commit/abort we zero out
-				 * PGPROC's xid before we mark its locks released.  If we see
-				 * zero in the xid field, assume the xact is in process of
-				 * shutting down and act as though the lock is already
-				 * released.
+				 * If we see an invalid VXID, then either the xact has already
+				 * committed (or aborted), or it's a prepared xact.  In either
+				 * case we may ignore it.
 				 */
-				if (TransactionIdIsValid(xid))
-					result = lappend_xid(result, xid);
+				if (VirtualTransactionIdIsValid(vxid))
+					vxids[count++] = vxid;
 			}
 		}
 
@@ -1930,7 +1980,10 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode)
 
 	LWLockRelease(partitionLock);
 
-	return result;
+	if (count > MaxBackends)	/* should never happen */
+		elog(PANIC, "too many conflicting locks found");
+
+	return vxids;
 }
 
 
@@ -1939,7 +1992,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode)
  *		Do the preparatory work for a PREPARE: make 2PC state file records
  *		for all locks currently held.
  *
- * Non-transactional locks are ignored.
+ * Non-transactional locks are ignored, as are VXID locks.
  *
  * There are some special cases that we error out on: we can't be holding
  * any session locks (should be OK since only VACUUM uses those) and we
@@ -1969,6 +2022,13 @@ AtPrepare_Locks(void)
 		if (!LockMethods[LOCALLOCK_LOCKMETHOD(*locallock)]->transactional)
 			continue;
 
+		/*
+		 * Ignore VXID locks.  We don't want those to be held by prepared
+		 * transactions, since they aren't meaningful after a restart.
+		 */
+		if (locallock->tag.lock.locktag_type == LOCKTAG_VIRTUALTRANSACTION)
+			continue;
+
 		/* Ignore it if we don't actually hold the lock */
 		if (locallock->nLocks <= 0)
 			continue;
@@ -1981,7 +2041,6 @@ AtPrepare_Locks(void)
 				elog(ERROR, "cannot PREPARE when session locks exist");
 		}
 
-		
 		/* gp-change 
 		 *
 		 * We allow 2PC commit transactions to include temp objects.  
@@ -1995,8 +2054,11 @@ AtPrepare_Locks(void)
 		 * destroyed at the end of the session, while the transaction will be
 		 * committed from another session.
 		 */
+		/* GPDB_83MERGE_FIXME: see previous comments on removing LockTagIsTemp */
+#if 0
 		if (LockTagIsTemp(&locallock->tag.lock))
 			continue;
+#endif
 
 		/*
 		 * Create a 2PC record.
@@ -2075,12 +2137,25 @@ PostPrepare_Locks(TransactionId xid)
 		if (!LockMethods[LOCALLOCK_LOCKMETHOD(*locallock)]->transactional)
 			continue;
 
+		/* Ignore VXID locks */
+		if (locallock->tag.lock.locktag_type == LOCKTAG_VIRTUALTRANSACTION)
+			continue;
+
 		/* MPP change for temp objects in 2PC.  we skip over temp
 		 * objects. MPP-1094: NOTE THIS CALL MAY ADD LOCKS TO OUR
 		 * TABLE!
 		 */
+		/* GPDB_83MERGE_FIXME: LockTagIsTemp() was removed in the merge,
+		 * by upstream commit f3032cbe377ecc570989e1bd2fe1aea455c12cc3. It's
+		 * not clear to me if it's still safe to skip over temp objects. I'm
+		 * pretty sure we must allow modifying temp tables in GPDB, because
+		 * every transaction uses 2PC, but how? Do we need to resurrect
+		 * LockTagIsTemp? Needs investigation...
+		 */
+#if 0
 		if (LockTagIsTemp(&locallock->tag.lock))
 			continue;
+#endif
 
 		/* since our temp-check may be modifying our lock table, we
 		 * just mark these as requiring more work */
@@ -2147,6 +2222,10 @@ PostPrepare_Locks(TransactionId xid)
 			
 			/* Ignore nontransactional locks */
 			if (!LockMethods[LOCK_LOCKMETHOD(*lock)]->transactional)
+				goto next_item;
+
+			/* Ignore VXID locks */
+			if (lock->tag.locktag_type == LOCKTAG_VIRTUALTRANSACTION)
 				goto next_item;
 
 			PROCLOCK_PRINT("PostPrepare_Locks", proclock);
@@ -2669,7 +2748,7 @@ lock_twophase_recover(TransactionId xid, uint16 info,
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of shared memory"),
-			errhint("You might need to increase max_locks_per_transaction.")));
+		  errhint("You might need to increase max_locks_per_transaction.")));
 	}
 
 	/*
@@ -2734,7 +2813,7 @@ lock_twophase_recover(TransactionId xid, uint16 info,
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of shared memory"),
-			errhint("You might need to increase max_locks_per_transaction.")));
+		  errhint("You might need to increase max_locks_per_transaction.")));
 	}
 
 	/*

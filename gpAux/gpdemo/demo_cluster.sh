@@ -4,7 +4,7 @@
 # Data Directories
 # ======================================================================
 
-DATADIRS=`pwd`/datadirs
+DATADIRS=${DATADIRS:-`pwd`/datadirs}
 QDDIR=$DATADIRS/qddir
 
 SEG_PREFIX=demoDataDir
@@ -208,6 +208,7 @@ if [ -d $DATADIRS ]; then
 fi
 mkdir $DATADIRS
 mkdir $QDDIR
+mkdir $DATADIRS/gpAdminLogs
 
 for dir in ${DIRVEC[@]} ${DIRVEC_MIRROR[@]}
 do
@@ -279,19 +280,17 @@ cat >> $CLUSTER_CONFIG <<-EOF
 	ENCODING=UNICODE
 EOF
 
-if [ `uname -p` != "sparc" ] && [ `uname -s` != "Darwin" ]; then
-	cat >> $CLUSTER_CONFIG <<-EOF
+cat >> $CLUSTER_CONFIG <<-EOF
+
+	# Array of mirror data locations for each hosts Segment Instances, the number of directories in this array will
+	# set the number of segment instances per host
+	declare -a MIRROR_DATA_DIRECTORY=(${DIRVEC_MIRROR[@]})
 	
-		# Array of mirror data locations for each hosts Segment Instances, the number of directories in this array will
-		# set the number of segment instances per host
-		declare -a MIRROR_DATA_DIRECTORY=(${DIRVEC_MIRROR[@]})
-		
-		MIRROR_PORT_BASE=`expr $DEMO_PORT_BASE + 3`
-	
-		REPLICATION_PORT_BASE=`expr $DEMO_PORT_BASE + 6`
-		MIRROR_REPLICATION_PORT_BASE=`expr $DEMO_PORT_BASE + 9`
-	EOF
-fi
+	MIRROR_PORT_BASE=`expr $DEMO_PORT_BASE + 3`
+
+	REPLICATION_PORT_BASE=`expr $DEMO_PORT_BASE + 6`
+	MIRROR_REPLICATION_PORT_BASE=`expr $DEMO_PORT_BASE + 9`
+EOF
 
 cat >> $CLUSTER_CONFIG <<-EOF
 
@@ -347,17 +346,17 @@ fi
 if [ -f "${CLUSTER_CONFIG_POSTGRES_ADDONS}" ]; then
     echo "=========================================================================================="
     echo "executing:"
-    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} \"$@\""
+    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} \"$@\""
     echo "=========================================================================================="
     echo ""
-    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} "$@"
+    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} "$@"
 else
     echo "=========================================================================================="
     echo "executing:"
-    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG \"$@\""
+    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs \"$@\""
     echo "=========================================================================================="
     echo ""
-    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG "$@"
+    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs "$@"
 fi
 RETURN=$?
 
@@ -401,4 +400,10 @@ cat > gpdemo-env.sh <<-EOF
 	export MASTER_DATA_DIRECTORY=$QDDIR/${SEG_PREFIX}-1
 EOF
 
-exit ${RETURN}
+if [ "${RETURN}" -gt 1 ];
+then
+    # gpinitsystem will return warnings as exit code 1
+    exit ${RETURN}
+else
+    exit 0
+fi

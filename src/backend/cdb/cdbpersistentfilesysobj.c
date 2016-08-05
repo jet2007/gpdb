@@ -907,6 +907,22 @@ void PersistentFileSysObj_ReadTuple(
 						tupleCopy);
 }
 
+uint64
+PersistentFileSysObj_RebuildFreeList(PersistentFsObjType fsObjType)
+{
+	Assert(fsObjType >= PersistentFsObjType_First);
+	Assert(fsObjType <= PersistentFsObjType_Last);
+
+	uint64 numFree;
+	WRITE_PERSISTENT_STATE_ORDERED_LOCK_DECLARE;
+	WRITE_PERSISTENT_STATE_ORDERED_LOCK;
+	numFree = PersistentStore_RebuildFreeList(
+			&(fileSysObjDataArray[fsObjType]->storeData),
+			&(fileSysObjSharedDataArray[fsObjType]->storeSharedData));
+	WRITE_PERSISTENT_STATE_ORDERED_UNLOCK;
+	return numFree;
+}
+
 void PersistentFileSysObj_AddTuple(
 	PersistentFsObjType			fsObjType,
 
@@ -3793,13 +3809,8 @@ void PersistentFileSysObj_PreparedEndXactAction(
 				mirrorCatchupRequired = false;
 			}
 
-#ifdef FAULT_INJECTOR
-			FaultInjector_InjectFaultIfSet(
-							UpdateCommittedEofInPersistentTable,
-							DDLNotSpecified,
-							"", 	// databaseName
-							"");	// tablename
-#endif
+			SIMPLE_FAULT_INJECTOR(UpdateCommittedEofInPersistentTable);
+
 			PersistentFileSysObj_UpdateAppendOnlyMirrorResyncEofs(
 															&eofs->relFileNode,
 															eofs->segmentFileNum,

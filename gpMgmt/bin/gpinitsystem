@@ -216,7 +216,7 @@ CHK_PARAMS () {
 		    unset PORT_BASE SEG_PREFIX DATA_DIRECTORY REPLICATION_PORT_BASE
 
 		    # Make sure it is not a dos file with CTRL M at end of each line
-		    $CAT $CLUSTER_CONFIG|$SED -e 's/^M$//g' > $TMP_FILE
+		    $CAT $CLUSTER_CONFIG|$SED -e 's/$//g' > $TMP_FILE
 		    $MV $TMP_FILE $CLUSTER_CONFIG
 		    LOG_MSG "[INFO]:-Dumping $CLUSTER_CONFIG to logfile for reference"
 		    $CAT $CLUSTER_CONFIG|$GREP -v "^#" >> $LOG_FILE
@@ -1013,10 +1013,10 @@ ARRAY_REORDER() {
             ;;
     esac
 
-    QE_REORDER_ARRAY=(`$ECHO ${QE_PRIMARY_ARRAY[@]}|$TR ' ' '\n'|$SORT -t$S -k2,2|$TR '\n' ' '`)
+    QE_REORDER_ARRAY=(`$ECHO ${QE_PRIMARY_ARRAY[@]}|$TR ' ' '\n'|$SORT -t$S -n -k2,2|$TR '\n' ' '`)
     QE_PRIMARY_ARRAY=(${QE_REORDER_ARRAY[@]})
     if [ $MIRROR_TYPE -eq 1 ];then
-	QE_REORDER_ARRAY=(`$ECHO ${QE_MIRROR_ARRAY[@]}|$TR ' ' '\n'|$SORT -t$S -k2,2|$TR '\n' ' '`)
+	QE_REORDER_ARRAY=(`$ECHO ${QE_MIRROR_ARRAY[@]}|$TR ' ' '\n'|$SORT -t$S -n -k2,2|$TR '\n' ' '`)
 	QE_MIRROR_ARRAY=(${QE_REORDER_ARRAY[@]})
     fi
     LOG_MSG "[INFO]:-End Function $FUNCNAME"
@@ -1461,10 +1461,10 @@ CREATE_QES_MIRROR () {
 		;;
 	esac
 
-	REORDERING=(`$ECHO ${QE_PRIMARY_ARRAY[@]}|$TR ' ' '\n'|$SORT -t$S -k5,5|$TR '\n' ' '`)
+	REORDERING=(`$ECHO ${QE_PRIMARY_ARRAY[@]}|$TR ' ' '\n'|$SORT -t$S -n -k5,5|$TR '\n' ' '`)
 	PRIMARIES_ORDERED_BY_CONTENT_ID=(${REORDERING[@]})
 
-	REORDERING=(`$ECHO ${QE_MIRROR_ARRAY[@]}|$TR ' ' '\n'|$SORT -t$S -k5,5|$TR '\n' ' '`)
+	REORDERING=(`$ECHO ${QE_MIRROR_ARRAY[@]}|$TR ' ' '\n'|$SORT -t$S -n -k5,5|$TR '\n' ' '`)
 	MIRRORS_ORDERED_BY_CONTENT_ID=(${REORDERING[@]})
 
 	PARALLEL_SETUP  $PARALLEL_STATUS_FILE
@@ -1510,7 +1510,7 @@ STOP_QD_PRODUCTION () {
     if [ -f $GPSTOP ]; then
 	GPSTOP_OPTS=$(OUTPUT_LEVEL_OPTS)
 	export MASTER_DATA_DIRECTORY=${MASTER_DIRECTORY}/${SEG_PREFIX}-1
-	$GPSTOP -a -i -m -d $MASTER_DATA_DIRECTORY $GPSTOP_OPTS
+	$GPSTOP -a -l $LOG_DIR -i -m -d $MASTER_DATA_DIRECTORY $GPSTOP_OPTS
 	RETVAL=$?
 	case $RETVAL in
 	    0 ) LOG_MSG "[INFO]:-Successfully shutdown the new Greenplum instance" ;;
@@ -1558,7 +1558,7 @@ START_QD_PRODUCTION () {
     if [ -f $GPSTART ]; then
 	GPSTART_OPTS=$(OUTPUT_LEVEL_OPTS)
 	export MASTER_DATA_DIRECTORY=${MASTER_DIRECTORY}/${SEG_PREFIX}-1
-	$GPSTART -a -d $MASTER_DATA_DIRECTORY $GPSTART_OPTS
+	$GPSTART -a -l $LOG_DIR -d $MASTER_DATA_DIRECTORY $GPSTART_OPTS
 
         if [ $? -eq 0 ];then
             LOG_MSG "[INFO]:-Successfully started new Greenplum instance"
@@ -1576,7 +1576,7 @@ START_QD_PRODUCTION () {
             if [ -f $GPSTOP ]; then
 		GPSTOP_OPTS=$(OUTPUT_LEVEL_OPTS)
                 export MASTER_DATA_DIRECTORY=${MASTER_DIRECTORY}/${SEG_PREFIX}-1
-                $GPSTOP -a -i -d $MASTER_DATA_DIRECTORY $GPSTOP_OPTS
+                $GPSTOP -a -l $LOG_DIR -i -d $MASTER_DATA_DIRECTORY $GPSTOP_OPTS
 
                 RETVAL=$?
                 case $RETVAL in
@@ -1702,7 +1702,7 @@ READ_INPUT_CONFIG () {
     fi
 
     # Make sure it is not a dos file with CTRL M at end of each line
-    $CAT $INPUT_CONFIG|$SED -e 's/^M$//g' > $TMP_FILE
+    $CAT $INPUT_CONFIG|$SED -e 's/$//g' > $TMP_FILE
     $MV $TMP_FILE $INPUT_CONFIG
     LOG_MSG "[INFO]:-Dumping $INPUT_CONFIG to logfile for reference"
     $CAT $INPUT_CONFIG|$GREP -v "^#" >> $LOG_FILE
@@ -1977,17 +1977,17 @@ if [ x"" != x"$PG_CONF_ADD_FILE" ]; then
 	fi
 fi
 if [ x"" != x"$LOG_DIR" ];then
-        CHK_DIR $LOG_DIR
+        CHK_DIR $LOG_DIR "" 1
         if [ $EXISTS -eq 1 ]; then
-                LOG_MSG "[WARN]:-Log directory $LOG_DIR does not exist, using default log directory" 1
-                EXIT_STATUS=1
-                BACKOUT_FILE=$DEFLOGDIR/backout_${PROG_NAME}_${USER_NAME}_${CUR_DATE}_$FILE_TIME
+                ERROR_EXIT "[FATAL]:-Log directory $LOG_DIR does not exist!" 2
         else
                 LOG_FILE=$LOG_DIR/${PROG_NAME}_${CUR_DATE}.log
                 BACKOUT_FILE=$LOG_DIR/backout_${PROG_NAME}_${USER_NAME}_${CUR_DATE}_$FILE_TIME
         fi
 else
         BACKOUT_FILE=$DEFLOGDIR/backout_${PROG_NAME}_${USER_NAME}_${CUR_DATE}_$FILE_TIME
+        # set $LOG_DIR to $DEFLOGDIR, so $LOG_DIR can be used everywhere
+        LOG_DIR=$DEFLOGDIR
 fi
 
 LOG_MSG "[INFO]:-Start Main"

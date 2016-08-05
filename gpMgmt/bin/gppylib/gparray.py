@@ -761,6 +761,18 @@ class Segment:
             if (prim_status, prim_mode, mirror_status, mirror_role) not in VALID_SEGMENT_STATES:
                 return False
         return True
+
+    def get_active_primary(self):
+        if self.primaryDB.isSegmentPrimary(current_role=True):
+            return self.primaryDB
+        else:
+            for mirror in self.mirrorDBs:
+                if mirror.isSegmentPrimary(current_role=True):
+                    return mirror
+
+    def get_primary_dbid(self):
+        return self.primaryDB.getSegmentDbId()
+
 # --------------------------------------------------------------------
 # --------------------------------------------------------------------
 class SegmentRow():
@@ -1446,34 +1458,35 @@ class GpArray:
                            hostname, address, port, fslocation, replicationPort)
                 segments.append(seg)
         
-        for seg in segments:
-            datcatloc = dbconn.execSQL(conn, '''
-                select fsloc.fselocation || '/' ||
-                       case when db.dattablespace = 1663
-                          then 'base'
-                          else db.dattablespace::text
-                       end || '/'||db.oid as catloc
-                from pg_Database db, pg_tablespace ts,
-                     (SELECT dbid, fs.oid, fselocation
-                      FROM pg_catalog.gp_segment_configuration
-                      JOIN pg_catalog.pg_filespace_entry on (dbid = fsedbid)
-                      JOIN pg_catalog.pg_filespace fs on (fsefsoid = fs.oid)) fsloc
-                      where db.dattablespace = ts.oid
-                      and ts.spcfsoid = fsloc.oid
-                      and fsloc.dbid = %d 
-            ''' % seg.dbid)
-            seg.catdirs = []
-            for row in datcatloc:
-                seg.catdirs.append(row[0])
-
+        datcatloc = dbconn.execSQL(conn, '''
+            select fsloc.dbid, fsloc.fselocation || '/' ||
+                   case when db.dattablespace = 1663
+                      then 'base'
+                      else db.dattablespace::text
+                   end || '/'||db.oid as catloc
+            from pg_Database db, pg_tablespace ts,
+                 (SELECT dbid, fs.oid, fselocation
+                  FROM pg_catalog.gp_segment_configuration
+                  JOIN pg_catalog.pg_filespace_entry on (dbid = fsedbid)
+                  JOIN pg_catalog.pg_filespace fs on (fsefsoid = fs.oid)) fsloc
+                  where db.dattablespace = ts.oid
+                  and ts.spcfsoid = fsloc.oid''')
         conn.close()
-        
+        catlocmap = {}
+        for row in datcatloc:
+            if catlocmap.has_key(row[0]):
+                catlocmap[row[0]].append(row[1])
+            else:
+                catlocmap[row[0]] = [row[1]]
+        for seg in segments:
+            seg.catdirs = catlocmap[seg.dbid]
+
         origSegments = [seg.copy() for seg in segments]
         
         if strategy_rows.rowcount == 0:
             raise Exception("Database does not contain gp_fault_strategy entry")
         if strategy_rows.rowcount > 1:
-            raise Exception("Database does too many gp_fault_strategy entries")
+            raise Exception("Database has too many gp_fault_strategy entries")
         strategy = strategy_rows.fetchone()[0]
 
         array = GpArray(segments, origSegments, strategy)
@@ -1722,6 +1735,14 @@ class GpArray:
                 dbs.extend(seg.get_dbs()) 
         return dbs
 
+    # --------------------------------------------------------------------
+    def getSegmentList(self, includeExpansionSegs=False):
+        """Return a list of all GpDb objects for all segments in the array"""
+        dbs=[]
+        dbs.extend(self.segments)
+        if includeExpansionSegs:
+            dbs.extend(self.expansionSegments)
+        return dbs
 
     # --------------------------------------------------------------------
     def getSegDbMap(self):
@@ -2244,6 +2265,7 @@ class GpArray:
         datadirs = {}
         used_ports = {}
         used_replication_ports = {}
+        hostname = ""
         for db in self.getDbList(True):
             datadir = db.getSegmentDataDirectory()
             hostname = db.getSegmentHostName()

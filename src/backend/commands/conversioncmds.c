@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/conversioncmds.c,v 1.31 2007/02/14 01:58:56 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/conversioncmds.c,v 1.32.2.1 2009/02/27 16:35:31 heikki Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -30,7 +30,7 @@
 #include "utils/syscache.h"
 
 #include "cdb/cdbvars.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 
 static void AlterConversionOwner_internal(Relation rel, Oid conversionOid,
 							  Oid newOwnerId);
@@ -110,6 +110,7 @@ CreateConversionCommand(CreateConversionStmt *stmt)
 					 CStringGetDatum(""),
 					 CStringGetDatum(result),
 					 Int32GetDatum(0));
+
 	/*
 	 * All seem ok, go ahead (possible failure would be a duplicate conversion
 	 * name)
@@ -119,7 +120,11 @@ CreateConversionCommand(CreateConversionStmt *stmt)
 					 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "CreateConversionCommand");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 }
 

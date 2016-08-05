@@ -30,14 +30,13 @@ static void extract_INT2OID_array(Datum array_datum, int *lenp, int16 **vecp);
  * createRandomDistribution -- Create a policy with random distribution
  */
 GpPolicy *
-createRandomDistribution(int maxattrs)
+createRandomDistribution(void)
 {
 	GpPolicy   *p = NULL;
 
-	p = (GpPolicy *) palloc(SizeOfGpPolicy(maxattrs));
+	p = (GpPolicy *) palloc0(sizeof(GpPolicy));
 	p->ptype = POLICYTYPE_PARTITIONED;
 	p->nattrs = 0;
-	p->attrs[0] = 1;
 
 	return p;
 }
@@ -202,7 +201,7 @@ GpPolicyFetch(MemoryContext mcxt, Oid tbloid)
 			Assert(nattrs >= 0);
 		}
 
-		/* Create an GpPolicy object. */
+		/* Create a GpPolicy object. */
 		policy = (GpPolicy *) MemoryContextAlloc(mcxt, SizeOfGpPolicy(nattrs));
 		policy->ptype = POLICYTYPE_PARTITIONED;
 		policy->nattrs = nattrs;
@@ -254,7 +253,6 @@ extract_INT2OID_array(Datum array_datum, int *lenp, int16 **vecp)
 /*
  * Sets the policy of a table into the gp_distribution_policy table
  * from a GpPolicy structure.
- *
  */
 void
 GpPolicyStore(Oid tbloid, const GpPolicy *policy)
@@ -326,7 +324,6 @@ GpPolicyStore(Oid tbloid, const GpPolicy *policy)
 /*
  * Sets the policy of a table into the gp_distribution_policy table
  * from a GpPolicy structure.
- *
  */
 void
 GpPolicyReplace(Oid tbloid, const GpPolicy *policy)
@@ -426,7 +423,6 @@ GpPolicyReplace(Oid tbloid, const GpPolicy *policy)
 
 /*
  * Removes the policy of a table from the gp_distribution_policy table
-
  * Does nothing if the policy doesn't exist.
  */
 void
@@ -457,7 +453,7 @@ GpPolicyRemove(Oid tbloid)
 
 /*
  * Returns true only if the policy is a randomly distributed.  In other cases,
- * including non-distributed table case, returns fase.
+ * including non-distributed table case, returns false.
  */
 bool
 GpPolicyIsRandomly(GpPolicy *policy)
@@ -527,7 +523,7 @@ checkPolicyForUniqueIndex(Relation rel, AttrNumber *indattr, int nidxatts,
 	 * If the existing policy is not a subset, we must either error out or
 	 * update the distribution policy. It might be tempting to say that even
 	 * when the policy is a subset, we should update it to match the index
-	 * definition. The problem then is that if the user actually wants to
+	 * definition. The problem then is that if the user actually wants a
 	 * distribution on (a, b) but then creates an index on (a, b, c) we'll
 	 * change the policy underneath them.
 	 *
@@ -536,7 +532,7 @@ checkPolicyForUniqueIndex(Relation rel, AttrNumber *indattr, int nidxatts,
 	 */
 	if (!bms_is_subset(polbm, indbm))
 	{
-		if (cdbRelSize(rel) != 0 || has_pkey || has_ukey || has_exprs)
+		if (cdbRelMaxSegSize(rel) != 0 || has_pkey || has_ukey || has_exprs)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),

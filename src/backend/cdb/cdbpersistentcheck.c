@@ -15,7 +15,7 @@
 #include "cdb/cdbpersistentstore.h"
 #include "cdb/cdbpersistentcheck.h"
 #include "cdb/cdbtm.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 
 #include "storage/itemptr.h"
 #include "access/genam.h"
@@ -1123,37 +1123,10 @@ bool Persistent_DBSpecificPTCatVerification (void)
 void
 Persistent_PostDTMRecv_NonDBSpecificPTCatVerification(void)
 {
-	PGresult  **pgresultSets = NULL;
-	StringInfoData errmsgbuf;
-	PGresult   *rs = NULL;
-	int i;
 	const char *cmdbuf = "select * from gp_nondbspecific_ptcat_verification()";
 
-	initStringInfo(&errmsgbuf);
-
 	/* call to all QE to perform verifications */
-	pgresultSets = cdbdisp_dispatchRMCommand(cmdbuf, /* withSnapshot */false,
-											 &errmsgbuf, NULL);
-
-	if (errmsgbuf.len > 0)
-	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-				errmsg("Failure seen during non-db specific verification"),
-				errdetail("%s", errmsgbuf.data)));
-
-		pfree(errmsgbuf.data);
-	}
-
-	rs = pgresultSets[0];
-	i=0;
-
-	do
-	{
-		PQclear(rs);
-	} while ((rs = pgresultSets[++i]) != NULL);
-
-	pfree(errmsgbuf.data);
-	free(pgresultSets);
+	CdbDispatchCommand(cmdbuf, DF_NONE, NULL);
 }
 
 /*
@@ -1163,37 +1136,10 @@ Persistent_PostDTMRecv_NonDBSpecificPTCatVerification(void)
 void
 Persistent_PostDTMRecv_DBSpecificPTCatVerification(void)
 {
-	PGresult  **pgresultSets = NULL;
-	StringInfoData errmsgbuf;
-	PGresult   *rs = NULL;
-	int i =0;
 	const char *cmdbuf = "select * from gp_dbspecific_ptcat_verification()";
 
-	initStringInfo(&errmsgbuf);
-
 	/* call to all QE to perform verifications */
-	pgresultSets = cdbdisp_dispatchRMCommand(cmdbuf, /* withSnapshot */false,
-											 &errmsgbuf, NULL);
-
-	/* display error messages */
-	if (errmsgbuf.len > 0)
-	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-				errmsg("Failure seen during non-db specific verification"),
-				errdetail("%s", errmsgbuf.data)));
-
-		pfree(errmsgbuf.data);
-	}
-
-	rs = pgresultSets[0];
-	i=0;
-	do
-	{
-		PQclear(rs);
-	} while ((rs = pgresultSets[++i]) != NULL);
-
-	pfree(errmsgbuf.data);
-	free(pgresultSets);
+	CdbDispatchCommand(cmdbuf, DF_NONE, NULL);
 }
 
 Datum

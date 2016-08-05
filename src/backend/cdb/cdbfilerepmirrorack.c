@@ -169,21 +169,6 @@ FileRepAckMirror_ConstructAndInsertMessage(
 						   FILEREP_UNDEFINED,
 						   fileRepMessageHeader->messageCount);	
 
-	if (Debug_filerep_print)
-		ereport(LOG,
-				(errmsg("M_ConstructAndInsertMessageAck construct and insert ack message "
-						"msg header crc '%u' message body length '%d' position insert '%p' ack state '%s' ",
-						fileRepMessageHeaderCrcLocal,
-						messageBodyLength,
-						msgPositionInsert,
-						FileRepAckStateToString[fileRepAckState]),
-				 FileRep_errdetail(fileRepIdentifier,
-								   fileRepRelationType,
-								   fileRepOperation,
-								   fileRepMessageHeader->messageCount),
-				 FileRep_errdetail_ShmemAck(),
-				 FileRep_errcontext()));			
-	
 	if (messageBodyLength)
 	{
 		fileRepMessageBody = (char *) (msgPositionInsert + 
@@ -432,13 +417,7 @@ FileRepAckMirror_RunSender(void)
 							   FILEREP_UNDEFINED,
 							   FILEREP_UNDEFINED);		
 				
-#ifdef FAULT_INJECTOR
-		FaultInjector_InjectFaultIfSet(
-									   FileRepSender,
-									   DDLNotSpecified,
-									   "",	//databaseName
-									   ""); // tableName
-#endif						
+		SIMPLE_FAULT_INJECTOR(FileRepSender);
 		
 		fileRepMessage = (char*) (fileRepAckShmem->positionConsume + 
 								  sizeof(FileRepShmemMessageDescr_s));

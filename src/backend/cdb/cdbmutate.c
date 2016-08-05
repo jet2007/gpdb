@@ -10,17 +10,24 @@
 
 #include "postgres.h"
 
-#include "optimizer/clauses.h"
 #include "parser/analyze.h"		/* for createRandomDistribution() */
 #include "parser/parsetree.h"	/* for rt_fetch() */
-#include "utils/lsyscache.h"	/* for getatttypetypmod() */
-#include "nodes/makefuncs.h"	/* for makeVar() */
 #include "parser/parse_expr.h"	/* for expr_type() */
 #include "parser/parse_oper.h"	/* for compatible_oper_opid() */
 #include "utils/relcache.h"     /* RelationGetPartitioningKey() */
 #include "optimizer/tlist.h"	/* get_sortgroupclause_tle() */
+#include "optimizer/planmain.h"
 #include "optimizer/predtest.h"
 #include "optimizer/var.h"
+#include "parser/parse_relation.h"
+#include "utils/lsyscache.h"
+#include "utils/datum.h"
+#include "utils/syscache.h"
+#include "utils/portal.h"
+#include "optimizer/clauses.h"
+#include "optimizer/planmain.h"
+#include "catalog/catquery.h"
+#include "nodes/makefuncs.h"
 
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -29,9 +36,8 @@
 #include "catalog/pg_type.h"
 
 #include "catalog/pg_proc.h"
-#include "utils/syscache.h"
 
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 #include "cdb/cdbhash.h"        /* isGreenplumDbHashable() */
 #include "cdb/cdbllize.h"
 #include "cdb/cdbmutate.h"
@@ -58,6 +64,17 @@ typedef struct ApplyMotionState
     int         numInitPlanMotionNodes;
     List       *initPlans;
 }	ApplyMotionState;
+
+typedef struct
+{
+	plan_tree_base_prefix base; /* Required prefix for plan_tree_walker/mutator */
+	bool single_row_insert;
+	List	   *cursorPositions;
+} pre_dispatch_function_evaluation_context;
+
+static Node *
+pre_dispatch_function_evaluation_mutator(Node *node,
+										 pre_dispatch_function_evaluation_context * context);
 
 /*
  * Forward Declarations
@@ -87,6 +104,8 @@ static bool
 doesUpdateAffectPartitionCols(PlannerInfo  *root,
 							  Plan         *plan,
                               Query        *query);
+
+static bool replace_shareinput_targetlists_walker(Node *node, PlannerGlobal *glob, bool fPop);
 
 /*
  * Given an expression, return true if it contains anything non-constant.
@@ -146,7 +165,7 @@ directDispatchCalculateHash(Plan *plan, GpPolicy *targetPolicy)
 	ListCell *cell=NULL;
 	bool directDispatch;
 
-	h = makeCdbHash(GpIdentity.numsegments, HASH_FNV_1);
+	h = makeCdbHash(GpIdentity.numsegments);
 	cdbhashinit(h);
 
 	/*
@@ -271,18 +290,17 @@ apply_motion(PlannerInfo *root, Plan *plan, Query *query)
 			{
 				List   *hashExpr;
 				ListCell *exp1;
-				int			maxattrs = 200;
 				
 				if (query->intoPolicy != NULL)
 				{
 					targetPolicy = query->intoPolicy;
 					Assert(query->intoPolicy->ptype == POLICYTYPE_PARTITIONED);
 					Assert(query->intoPolicy->nattrs >= 0);
-					Assert(query->intoPolicy->nattrs <= 1024);
+					Assert(query->intoPolicy->nattrs <= MaxPolicyAttributeNumber);
 				}
 				else if (gp_create_table_random_default_distribution)
 				{
-					targetPolicy = createRandomDistribution(maxattrs);
+					targetPolicy = createRandomDistribution();
 					ereport(NOTICE,
 						(errcode(ERRCODE_SUCCESSFUL_COMPLETION),
 						 errmsg("Using default RANDOM distribution since no distribution was specified."),
@@ -290,15 +308,17 @@ apply_motion(PlannerInfo *root, Plan *plan, Query *query)
 				}
 				else
 				{
-					/* User did not specify a DISTRIBUTED BY clause */
-				
-					targetPolicy = palloc0(sizeof(GpPolicy)- sizeof(targetPolicy->attrs) + maxattrs * sizeof(targetPolicy->attrs[0]));
-					targetPolicy->nattrs = 0;
-					
-					targetPolicy->ptype = POLICYTYPE_PARTITIONED;
-					
 					/* Find out what the flow is partitioned on */
 					hashExpr = plan->flow->hashExpr;
+
+					/* User did not specify a DISTRIBUTED BY clause */
+					if (hashExpr)
+						targetPolicy = palloc0(sizeof(GpPolicy)- sizeof(targetPolicy->attrs) + list_length(hashExpr) * sizeof(targetPolicy->attrs[0]));
+					else
+						targetPolicy = palloc0(sizeof(GpPolicy));
+
+					targetPolicy->ptype = POLICYTYPE_PARTITIONED;
+					targetPolicy->nattrs = 0;
 					
 					if(hashExpr)
 						foreach(exp1, hashExpr)
@@ -346,6 +366,7 @@ apply_motion(PlannerInfo *root, Plan *plan, Query *query)
 									{
 										/* If it is, use it to partition the result table, to avoid
 										 * unnecessary redistibution of data */
+										Assert(targetPolicy->nattrs < MaxPolicyAttributeNumber);
 										targetPolicy->attrs[targetPolicy->nattrs++] = n;
 										found_expr = true;
 										break;
@@ -1718,8 +1739,8 @@ cdbmutate_warn_ctid_without_segid(struct PlannerInfo *root, struct RelOptInfo *r
  * Shareinput fix shared_as_id and underlying_share_id of nodes in place.  We do not want to use
  * the ordinary tree walker as it is unnecessary to make copies etc.
  */
-typedef bool (*SHAREINPUT_MUTATOR) (Node *node, ApplyShareInputContext *ctxt, bool fPop);
-static void shareinput_walker(SHAREINPUT_MUTATOR f, Node *node, ApplyShareInputContext *ctxt)
+typedef bool (*SHAREINPUT_MUTATOR) (Node *node, PlannerGlobal *glob, bool fPop);
+static void shareinput_walker(SHAREINPUT_MUTATOR f, Node *node, PlannerGlobal *glob)
 {
 	Plan *plan = NULL; 
 	bool recursive_down;
@@ -1734,7 +1755,7 @@ static void shareinput_walker(SHAREINPUT_MUTATOR f, Node *node, ApplyShareInputC
 		foreach(lc, l)
 		{
 			Node* n = lfirst(lc);
-			shareinput_walker(f, n, ctxt);
+			shareinput_walker(f, n, glob);
 		}
 		return;
 	}
@@ -1743,7 +1764,7 @@ static void shareinput_walker(SHAREINPUT_MUTATOR f, Node *node, ApplyShareInputC
 		return;
 
 	plan = (Plan *) node;
-	recursive_down = (*f)(node, ctxt, false);
+	recursive_down = (*f)(node, glob, false);
 
 	if(recursive_down) 
 	{
@@ -1752,26 +1773,31 @@ static void shareinput_walker(SHAREINPUT_MUTATOR f, Node *node, ApplyShareInputC
 			ListCell *cell;
 			Append *app = (Append *) node;
 			foreach(cell, app->appendplans)
-				shareinput_walker(f, (Node *)lfirst(cell), ctxt);
+				shareinput_walker(f, (Node *)lfirst(cell), glob);
 		}
 		else if(IsA(node, SubqueryScan))
 		{
 			SubqueryScan *subqscan = (SubqueryScan *) node;
-			shareinput_walker(f, (Node *) subqscan->subplan, ctxt);
+			List	   *save_rtable;
+
+			save_rtable = glob->share.curr_rtable;
+			glob->share.curr_rtable = subqscan->subrtable;
+			shareinput_walker(f, (Node *) subqscan->subplan, glob);
+			glob->share.curr_rtable = save_rtable;
 		}
 		else if(IsA(node, BitmapAnd))
 		{
 			ListCell *cell;
 			BitmapAnd *ba = (BitmapAnd *) node;
 			foreach(cell, ba->bitmapplans)
-				shareinput_walker(f, (Node *)lfirst(cell), ctxt);
+				shareinput_walker(f, (Node *)lfirst(cell), glob);
 		}
 		else if(IsA(node, BitmapOr))
 		{
 			ListCell *cell;
 			BitmapOr *bo = (BitmapOr *) node;
 			foreach(cell, bo->bitmapplans)
-				shareinput_walker(f, (Node *)lfirst(cell), ctxt);
+				shareinput_walker(f, (Node *)lfirst(cell), glob);
 		}
 		else if(IsA(node, NestLoop))
 		{
@@ -1779,33 +1805,33 @@ static void shareinput_walker(SHAREINPUT_MUTATOR f, Node *node, ApplyShareInputC
 			NestLoop *nl = (NestLoop *) node;
 			if(nl->join.prefetch_inner)
 			{
-				shareinput_walker(f, (Node *)plan->righttree, ctxt);
-				shareinput_walker(f, (Node *)plan->lefttree, ctxt);
+				shareinput_walker(f, (Node *)plan->righttree, glob);
+				shareinput_walker(f, (Node *)plan->lefttree, glob);
 			}
 			else	
 			{
-				shareinput_walker(f, (Node *)plan->lefttree, ctxt);
-				shareinput_walker(f, (Node *)plan->righttree, ctxt);
+				shareinput_walker(f, (Node *)plan->lefttree, glob);
+				shareinput_walker(f, (Node *)plan->righttree, glob);
 			}
 		}
 		else if(IsA(node, HashJoin))
 		{
 			/* Hash join the hash table is at inner */
-			shareinput_walker(f, (Node *)plan->righttree, ctxt);
-			shareinput_walker(f, (Node *)plan->lefttree, ctxt);
+			shareinput_walker(f, (Node *)plan->righttree, glob);
+			shareinput_walker(f, (Node *)plan->lefttree, glob);
 		}
 		else if (IsA(node, MergeJoin))
 		{
 			MergeJoin *mj = (MergeJoin *) node;
 			if (mj->unique_outer)
 			{
-				shareinput_walker(f, (Node *)plan->lefttree, ctxt);
-				shareinput_walker(f, (Node *)plan->righttree, ctxt);
+				shareinput_walker(f, (Node *)plan->lefttree, glob);
+				shareinput_walker(f, (Node *)plan->righttree, glob);
 			}
 			else
 			{
-				shareinput_walker(f, (Node *)plan->righttree, ctxt);
-				shareinput_walker(f, (Node *)plan->lefttree, ctxt);
+				shareinput_walker(f, (Node *)plan->righttree, glob);
+				shareinput_walker(f, (Node *)plan->lefttree, glob);
 			}
 		}
 		else if (IsA(node, Sequence))
@@ -1814,24 +1840,31 @@ static void shareinput_walker(SHAREINPUT_MUTATOR f, Node *node, ApplyShareInputC
 			Sequence *sequence = (Sequence *) node;
 			foreach(cell, sequence->subplans)
 			{
-				shareinput_walker(f, (Node *)lfirst(cell), ctxt);
+				shareinput_walker(f, (Node *)lfirst(cell), glob);
 			}
 		}
 		else
 		{
-			shareinput_walker(f, (Node *)plan->lefttree, ctxt);
-			shareinput_walker(f, (Node *)plan->righttree, ctxt);
-			shareinput_walker(f, (Node *)plan->initPlan, ctxt);
+			shareinput_walker(f, (Node *)plan->lefttree, glob);
+			shareinput_walker(f, (Node *)plan->righttree, glob);
+			shareinput_walker(f, (Node *)plan->initPlan, glob);
 		}
 	}
 
-	(*f)(node, ctxt, true);
+	(*f)(node, glob, true);
 }
 
-static void leftdeep_walker(SHAREINPUT_MUTATOR f, Node *node, ApplyShareInputContext *ctxt)
+typedef struct
 {
-	Plan *plan = NULL; 
-	bool recursive_down;
+	int			nextPlanId;
+	List	   *planNodes;
+} assign_plannode_id_walker_context;
+
+static void
+assign_plannode_id_walker(Node *node, assign_plannode_id_walker_context *ctxt)
+{
+	Plan	   *plan;
+	Plan	   *parent;
 
 	if(node == NULL)
 		return;
@@ -1843,7 +1876,7 @@ static void leftdeep_walker(SHAREINPUT_MUTATOR f, Node *node, ApplyShareInputCon
 		foreach(lc, l)
 		{
 			Node* n = lfirst(lc);
-			leftdeep_walker(f, n, ctxt);
+			assign_plannode_id_walker(n, ctxt);
 		}
 		return;
 	}
@@ -1852,96 +1885,282 @@ static void leftdeep_walker(SHAREINPUT_MUTATOR f, Node *node, ApplyShareInputCon
 		return;
 
 	plan = (Plan *) node;
-	recursive_down = (*f)(node, ctxt, false);
 
-	if(recursive_down) 
+	plan->plan_node_id = ++ctxt->nextPlanId;
+
+	parent = ctxt->planNodes == NIL ? NIL : linitial(ctxt->planNodes);
+
+	if(!parent)
+		plan->plan_parent_node_id = -1;
+	else
+		plan->plan_parent_node_id = parent->plan_node_id;
+
+	ctxt->planNodes = lcons(plan, ctxt->planNodes);
+
+	if(IsA(node, Append))
 	{
-		if(IsA(node, Append))
-		{
-			ListCell *cell;
-			Append *app = (Append *) node;
-			foreach(cell, app->appendplans)
-				leftdeep_walker(f, (Node *)lfirst(cell), ctxt);
-		}
-		else if(IsA(node, BitmapAnd))
-		{
-			ListCell *cell;
-			BitmapAnd *ba = (BitmapAnd *) node;
-			foreach(cell, ba->bitmapplans)
-				leftdeep_walker(f, (Node *)lfirst(cell), ctxt);
-		}
-		else if(IsA(node, BitmapOr))
-		{
-			ListCell *cell;
-			BitmapOr *bo = (BitmapOr *) node;
-			foreach(cell, bo->bitmapplans)
-				leftdeep_walker(f, (Node *)lfirst(cell), ctxt);
-		}
-		else if(IsA(node, SubqueryScan))
-		{
-			SubqueryScan *subqscan = (SubqueryScan *) node;
-			leftdeep_walker(f, (Node *) subqscan->subplan, ctxt);
-		}
-		else
-		{
-			leftdeep_walker(f, (Node *)plan->lefttree, ctxt);
-			leftdeep_walker(f, (Node *)plan->righttree, ctxt);
-			leftdeep_walker(f, (Node *)plan->initPlan, ctxt);
-		}
+		ListCell *cell;
+		Append *app = (Append *) node;
+		foreach(cell, app->appendplans)
+			assign_plannode_id_walker((Node *)lfirst(cell), ctxt);
+	}
+	else if(IsA(node, BitmapAnd))
+	{
+		ListCell *cell;
+		BitmapAnd *ba = (BitmapAnd *) node;
+		foreach(cell, ba->bitmapplans)
+			assign_plannode_id_walker((Node *)lfirst(cell), ctxt);
+	}
+	else if(IsA(node, BitmapOr))
+	{
+		ListCell *cell;
+		BitmapOr *bo = (BitmapOr *) node;
+		foreach(cell, bo->bitmapplans)
+			assign_plannode_id_walker((Node *)lfirst(cell), ctxt);
+	}
+	else if(IsA(node, SubqueryScan))
+	{
+		SubqueryScan *subqscan = (SubqueryScan *) node;
+		assign_plannode_id_walker((Node *) subqscan->subplan, ctxt);
+	}
+	else
+	{
+		assign_plannode_id_walker((Node *)plan->lefttree, ctxt);
+		assign_plannode_id_walker((Node *)plan->righttree, ctxt);
+		assign_plannode_id_walker((Node *)plan->initPlan, ctxt);
 	}
 
-	(*f)(node, ctxt, true);
+	list_delete_first(ctxt->planNodes);
 }
 
-/* 
- * DAG to Tree
- * Zap children if I am not the first sharer (not recursive down).  
- * Assign share_id to both ShareInputScan and Material/Sort.
+/*
+ * Create a fake CTE range table entry that reflects the target list of a
+ * shared input.
  */
-static bool shareinput_mutator_dag_to_tree(Node *node, ApplyShareInputContext* ctxt, bool fPop)
+static RangeTblEntry *
+create_shareinput_producer_rte(ApplyShareInputContext *ctxt, int share_id,
+							   int refno)
 {
-	Plan *plan = (Plan *) node;
+	int			attno = 1;
+	ListCell   *lc;
+	Plan	   *subplan;
+	char		buf[100];
+	RangeTblEntry *rte;
+	List	   *colnames = NIL;
+	List	   *coltypes = NIL;
+	List	   *coltypmods = NIL;
+	ShareInputScan *producer;
 
-	if(fPop)
+	Assert(ctxt->producer_count > share_id);
+	producer = ctxt->producers[share_id];
+	subplan = producer->scan.plan.lefttree;
+
+	foreach(lc, subplan->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Oid			vartype;
+		int32		vartypmod;
+		char	   *resname;
+
+		vartype = exprType((Node *) tle->expr);
+		vartypmod = exprTypmod((Node *) tle->expr);
+
+		/*
+		 * We should've filled in tle->resname in
+		 * shareinput_save_producer(). Note that it's too late to call
+		 * get_tle_name() here, because this runs after all the varnos in Vars
+		 * have already been changed to INNER/OUTER.
+		 */
+		resname = tle->resname;
+		if (!resname)
+			resname = pstrdup("unnamed_attr");
+
+		colnames = lappend(colnames, makeString(resname));
+		coltypes = lappend_oid(coltypes, vartype);
+		coltypmods = lappend_int(coltypmods, vartypmod);
+		attno++;
+	}
+
+	/*
+	 * Create a new RTE. Note that we use a different RTE for each reference,
+	 * because we want to give each reference a different name.
+	 */
+	snprintf(buf, sizeof(buf), "share%d_ref%d", share_id, refno);
+
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_CTE;
+	rte->ctename = pstrdup(buf);
+	rte->ctelevelsup = 0;
+	rte->self_reference = false;
+	rte->alias = NULL;
+
+	rte->eref = makeAlias(rte->ctename, colnames);
+	rte->ctecoltypes = coltypes;
+	rte->ctecoltypmods = coltypmods;
+
+	rte->inh = false;
+	rte->inFromCl = false;
+
+	rte->requiredPerms = 0;
+	rte->checkAsUser = InvalidOid;
+
+	return rte;
+}
+
+/*
+ * Memorize the producer of a shared input in an array of producers, one
+ * producer per share_id.
+ */
+static void
+shareinput_save_producer(ShareInputScan *plan, ApplyShareInputContext *ctxt)
+{
+	int			share_id = plan->share_id;
+	int			new_producer_count = (share_id + 1);
+
+	Assert(plan->share_id >= 0);
+
+	if (ctxt->producers == NULL)
+	{
+		ctxt->producers = palloc0(sizeof(ShareInputScan *) * new_producer_count);
+		ctxt->producer_count = new_producer_count;
+	}
+	else if (ctxt->producer_count < new_producer_count)
+	{
+		ctxt->producers = repalloc(ctxt->producers, new_producer_count * sizeof(ShareInputScan *));
+		memset(&ctxt->producers[ctxt->producer_count], 0, (new_producer_count - ctxt->producer_count) * sizeof(ShareInputScan *));
+		ctxt->producer_count = new_producer_count;
+	}
+
+	Assert(ctxt->producers[share_id] == NULL);
+	ctxt->producers[share_id] = plan;
+}
+
+/*
+ * When a plan comes out of the planner, all the ShareInputScan nodes belonging
+ * to the same "share" have the same child node. apply_shareinput_dag_to_tree()
+ * turns the DAG into a proper tree. The first occurrence of a ShareInput scan,
+ * with a particular child tree, becomes the "producer" of the share, and the
+ * others becomes consumers. The subtree is removed from all the consumer nodes.
+ *
+ * Also, a share_id is assigned to each ShareInputScan node, as well as the
+ * Material/Sort nodes below the producers. The producers and its consumers
+ * are linked together by the same share_id.
+ */
+static bool
+shareinput_mutator_dag_to_tree(Node *node, PlannerGlobal *glob, bool fPop)
+{
+	ApplyShareInputContext *ctxt = &glob->share;
+	Plan	   *plan = (Plan *) node;
+
+	if (fPop)
 		return true;
 
-	if(IsA(plan, ShareInputScan))
+	if (IsA(plan, ShareInputScan))
 	{
-		Plan *subplan = plan->lefttree;
+		ShareInputScan *siscan = (ShareInputScan *) plan;
+		Plan	   *subplan = plan->lefttree;
+		int			i;
+		int			attno;
+		ListCell   *lc;
 
-		Assert(subplan);
-		Assert(IsA(subplan, Material) || IsA(subplan, Sort));
-		Assert(get_plan_share_id(plan) == SHARE_ID_NOT_ASSIGNED);
-		Assert(plan->righttree == NULL);
-		Assert(plan->initPlan == NULL);
-
-		if(list_member_ptr(ctxt->sharedNodes, subplan))
+		/* Is there a producer for this sub-tree already? */
+		for (i = 0; i < ctxt->producer_count; i++)
 		{
-			Assert(get_plan_share_id(subplan) >= 0);
-			set_plan_share_id(plan, get_plan_share_id(subplan));
-			plan->lefttree = NULL;
-			return false;
+			if (ctxt->producers[i] && ctxt->producers[i]->scan.plan.lefttree == subplan)
+			{
+				/*
+				 * Yes. This is a consumer. Remove the subtree, and assign
+				 * the same share_id as the producer.
+				 */
+				Assert(get_plan_share_id((Plan *)ctxt->producers[i]) == i);
+				set_plan_share_id((Plan *) plan, ctxt->producers[i]->share_id);
+				siscan->scan.plan.lefttree = NULL;
+				return false;
+			}
 		}
-		else
+
+		/*
+		 * Couldn't find a match in existing list of producers, so this
+		 * is a producer. Add this to the list of producers, and assign
+		 * a new share_id.
+		 */
+		Assert(get_plan_share_id(subplan) == SHARE_ID_NOT_ASSIGNED);
+		set_plan_share_id((Plan *) plan, ctxt->producer_count);
+		set_plan_share_id(subplan, ctxt->producer_count);
+
+		shareinput_save_producer(siscan, ctxt);
+
+		/*
+		 * Also make sure that all the entries in the subplan's target list
+		 * have human-readable column names. They are used for EXPLAIN.
+		 */
+		attno = 1;
+		foreach(lc, subplan->targetlist)
 		{
-			Assert(get_plan_share_id(subplan) == SHARE_ID_NOT_ASSIGNED);
-			set_plan_share_id(subplan, list_length(ctxt->sharedNodes));
-			set_plan_share_id(plan, get_plan_share_id(subplan));
-			ctxt->sharedNodes = lappend(ctxt->sharedNodes, subplan);
-			return true;
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+			if (tle->resname == NULL)
+			{
+				char		default_name[100];
+				char	   *resname;
+
+				snprintf(default_name, sizeof(default_name), "col_%d", attno);
+
+				resname = strVal(get_tle_name(tle, ctxt->curr_rtable, default_name));
+				tle->resname = pstrdup(resname);
+			}
+			attno++;
 		}
 	}
 
 	return true;
 }
 
-/* 
- * Apply the share input mutator.
- */
-Plan *apply_shareinput_dag_to_tree(Plan *plan, ApplyShareInputContext *ctxt)
+Plan *
+apply_shareinput_dag_to_tree(PlannerGlobal *glob, Plan *plan, List *rtable)
 {
-	shareinput_walker(shareinput_mutator_dag_to_tree, (Node *) plan, ctxt);
+	glob->share.curr_rtable = rtable;
+	shareinput_walker(shareinput_mutator_dag_to_tree, (Node *) plan, glob);
 	return plan;
+}
+
+/*
+ * Collect all the producer ShareInput nodes into an array, for later use by
+ * replace_shareinput_targetlists().
+ *
+ * This is a stripped-down version of apply_shareinput_dag_to_tree(), for use
+ * on ORCA-produced plans. ORCA assigns share_ids to all ShareInputScan nodes,
+ * and only producer nodes have a subtree, so we don't need to do the DAG to
+ * tree conversion or assign share_ids here.
+ */
+static bool
+collect_shareinput_producers_walker(Node *node, PlannerGlobal *glob, bool fPop)
+{
+	ApplyShareInputContext *ctxt = &glob->share;
+
+	if (fPop)
+		return true;
+
+	if (IsA(node, ShareInputScan))
+	{
+		ShareInputScan	   *siscan = (ShareInputScan *) node;
+		Plan	   *subplan = siscan->scan.plan.lefttree;
+
+		Assert(get_plan_share_id((Plan *) siscan) >= 0);
+
+		if (subplan)
+		{
+			shareinput_save_producer(siscan, ctxt);
+		}
+	}
+	return true;
+}
+
+void
+collect_shareinput_producers(PlannerGlobal *glob, Plan *plan, List *rtable)
+{
+	glob->share.curr_rtable = rtable;
+	shareinput_walker(collect_shareinput_producers_walker, (Node *) plan, glob);
 }
 
 /* Some helper: implements a stack using List. */
@@ -1958,49 +2177,153 @@ static int shareinput_peekmot(ApplyShareInputContext *ctxt)
 	return linitial_int(ctxt->motStack);
 }
 
+
+/*
+ * Replace the target list of ShareInputScan nodes, with references
+ * to CTEs that we build on the fly.
+ *
+ * Only one of the ShareInputScan nodes in a plan tree contains the real
+ * child plan, while others contain just a "share id" that binds all the
+ * ShareInputScan nodes sharing the same input together. The missing
+ * child plan is a problem for EXPLAIN, as any OUTER Vars in the
+ * ShareInputScan's target list cannot be resolved without the child
+ * plan.
+ *
+ * To work around that issue, create a CTE for each shared input node, with
+ * columns that match the target list of the SharedInputScan's subplan,
+ * and replace the target list entries of the SharedInputScan with
+ * Vars that point to the CTE instead of the child plan.
+ */
+Plan *
+replace_shareinput_targetlists(PlannerGlobal *glob, Plan *plan, List *rtable)
+{
+	shareinput_walker(replace_shareinput_targetlists_walker, (Node *) plan, glob);
+	return plan;
+}
+
+static bool
+replace_shareinput_targetlists_walker(Node *node, PlannerGlobal *glob, bool fPop)
+{
+	ApplyShareInputContext *ctxt = &glob->share;
+
+	if (fPop)
+		return true;
+
+	if(IsA(node, ShareInputScan))
+	{
+		ShareInputScan *sisc = (ShareInputScan *) node;
+		int			share_id = sisc->share_id;
+		ListCell   *lc;
+		int			attno;
+		List	   *newtargetlist;
+		RangeTblEntry *rte;
+
+		/*
+		 * Note that even though the planner assigns sequential share_ids for each
+		 * shared node, so that share_id is always below list_length(ctxt->sharedNodes),
+		 * ORCA has a different assignment scheme. So we have to be prepared for any
+		 * share_id, at least when ORCA is in use.
+		 */
+		if (ctxt->share_refcounts == NULL)
+		{
+			int			new_sz = share_id + 1;
+
+			ctxt->share_refcounts = palloc0(new_sz * sizeof(int));
+			ctxt->share_refcounts_sz = new_sz;
+		}
+		else if (share_id >= ctxt->share_refcounts_sz)
+		{
+			int			old_sz = ctxt->share_refcounts_sz;
+			int			new_sz = share_id + 1;
+
+			ctxt->share_refcounts = repalloc(ctxt->share_refcounts, new_sz * sizeof(int));
+			memset(&ctxt->share_refcounts[old_sz], 0, (new_sz - old_sz) * sizeof(int));
+			ctxt->share_refcounts_sz = new_sz;
+		}
+
+		ctxt->share_refcounts[share_id]++;
+
+		/*
+		 * Create a new RTE. Note that we use a different RTE for each reference,
+		 * because we want to give each reference a different name.
+		 */
+		rte = create_shareinput_producer_rte(ctxt, share_id,
+											 ctxt->share_refcounts[share_id]);
+
+		glob->finalrtable = lappend(glob->finalrtable, rte);
+		sisc->scan.scanrelid = list_length(glob->finalrtable);
+
+		/*
+		 * Replace all the target list entries.
+		 *
+		 * SharedInputScan nodes are not projection-capable, so the target list
+		 * of the SharedInputScan matches the subplan's target list.
+		 */
+		newtargetlist = NIL;
+		attno = 1;
+		foreach(lc, sisc->scan.plan.targetlist)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+			TargetEntry *newtle = flatCopyTargetEntry(tle);
+
+			newtle->expr = (Expr *) makeVar(sisc->scan.scanrelid, attno,
+											exprType((Node *) tle->expr),
+											exprTypmod((Node *) tle->expr),
+											0);
+			newtargetlist = lappend(newtargetlist, newtle);
+			attno++;
+		}
+		sisc->scan.plan.targetlist = newtargetlist;
+	}
+
+	return true;
+}
+
+
 typedef struct ShareNodeWithSliceMark
 {
 	Plan *plan;
 	int slice_mark;
 } ShareNodeWithSliceMark;
 
-static bool shareinput_find_sharenode(ApplyShareInputContext *ctxt, int share_id, ShareNodeWithSliceMark *result)
+static bool
+shareinput_find_sharenode(ApplyShareInputContext *ctxt, int share_id, ShareNodeWithSliceMark *result)
 {
-	ListCell *lc;
-	ListCell *lc_slicemark;
-	
-	if(ctxt->sharedNodes == NULL)
+	ShareInputScan *siscan;
+	Plan	   *plan;
+
+	Assert(share_id < ctxt->producer_count);
+	if (share_id >= ctxt->producer_count)
 		return false;
 
-	forboth(lc, ctxt->sharedNodes, lc_slicemark, ctxt->sliceMarks)
-	{
-		Plan *plan = (Plan *) lfirst(lc);
+	siscan = ctxt->producers[share_id];
+	if (!siscan)
+		return false;
 
-		Assert(IsA(plan, Material) || IsA(plan, Sort));
-		if(get_plan_share_id(plan) == share_id)
-		{
-			if(result)
-			{
-				result->plan = plan;
-				result->slice_mark = lfirst_int(lc_slicemark);
-			}
-			return true;
-		}
+	plan = siscan->scan.plan.lefttree;
+
+	Assert(get_plan_share_id(plan) == share_id);
+	Assert(IsA(plan, Material) || IsA(plan, Sort));
+
+	if (result)
+	{
+		result->plan = plan;
+		result->slice_mark = ctxt->sliceMarks[share_id];
 	}
 
-	return false;
+	return true;
 }
 
 /* 
  * First walk on shareinput xslice.  It does the following:
  *
- * 1. Build the sharedNodes in context.
- * 2. Build the sliceMarks in context.
- * 3. Build a list a share on QD
+ * 1. Build the sliceMarks in context.
+ * 2. Build a list a share on QD
  */
 static bool
-shareinput_mutator_xslice_1(Node* node, ApplyShareInputContext *ctxt, bool fPop)
+shareinput_mutator_xslice_1(Node* node, PlannerGlobal *glob, bool fPop)
 {
+	ApplyShareInputContext *ctxt = &glob->share;
 	Plan *plan = (Plan *) node;
 
 	if(fPop)
@@ -2023,21 +2346,26 @@ shareinput_mutator_xslice_1(Node* node, ApplyShareInputContext *ctxt, bool fPop)
 		int motId = shareinput_peekmot(ctxt);
 		Plan *shared = plan->lefttree;
 
-		Assert(sisc->plan.flow);
-		if(sisc->plan.flow->flotype == FLOW_SINGLETON)
+		Assert(sisc->scan.plan.flow);
+		if(sisc->scan.plan.flow->flotype == FLOW_SINGLETON)
 		{
-			if(sisc->plan.flow->segindex < 0) 
+			if(sisc->scan.plan.flow->segindex < 0) 
 				ctxt->qdShares = list_append_unique_int(ctxt->qdShares, sisc->share_id);
 		}
 
 		if (shared)
 		{
-			Assert(shareinput_find_sharenode(ctxt, sisc->share_id, NULL) == false);
 			Assert(get_plan_share_id(plan) == get_plan_share_id(shared));
 			set_plan_driver_slice(shared, motId);
 
-			ctxt->sharedNodes = lappend(ctxt->sharedNodes, shared);
-			ctxt->sliceMarks = lappend_int(ctxt->sliceMarks, motId);
+			/*
+			 * We need to repopulate the producers array. cdbparallelize() was
+			 * run on the plan tree between shareinput_mutator_dag_to_tree() and
+			 * here, which copies all the nodes, and the destroys the producers
+			 * array in the process.
+			 */
+			ctxt->producers[sisc->share_id] = sisc;
+			ctxt->sliceMarks[sisc->share_id] = motId;
 		}
 	}
 
@@ -2049,8 +2377,9 @@ shareinput_mutator_xslice_1(Node* node, ApplyShareInputContext *ctxt, bool fPop)
  * if a 'shared' is cross-slice.
  */
 static bool
-shareinput_mutator_xslice_2(Node* node, ApplyShareInputContext *ctxt, bool fPop)
+shareinput_mutator_xslice_2(Node* node, PlannerGlobal *glob, bool fPop)
 {
+	ApplyShareInputContext *ctxt = &glob->share;
 	Plan	   *plan = (Plan *) node;
 
 	if (fPop)
@@ -2105,8 +2434,9 @@ shareinput_mutator_xslice_2(Node* node, ApplyShareInputContext *ctxt, bool fPop)
  * 	2. Bulid a list of QD slices
  */
 static bool
-shareinput_mutator_xslice_3(Node *node, ApplyShareInputContext *ctxt, bool fPop)
+shareinput_mutator_xslice_3(Node *node, PlannerGlobal *glob, bool fPop)
 {
+	ApplyShareInputContext *ctxt = &glob->share;
 	Plan *plan = (Plan *) node;
 
 	if(fPop)
@@ -2155,8 +2485,8 @@ shareinput_mutator_xslice_3(Node *node, ApplyShareInputContext *ctxt, bool fPop)
 
 		if(list_member_int(ctxt->qdShares, sisc->share_id))
 		{
-			Assert(sisc->plan.flow);
-			Assert(sisc->plan.flow->flotype == FLOW_SINGLETON);
+			Assert(sisc->scan.plan.flow);
+			Assert(sisc->scan.plan.flow->flotype == FLOW_SINGLETON);
 			ctxt->qdSlices = list_append_unique_int(ctxt->qdSlices, motId);
 		}
 	}
@@ -2168,8 +2498,9 @@ shareinput_mutator_xslice_3(Node *node, ApplyShareInputContext *ctxt, bool fPop)
  * this share must be on QD.  Move them to QD.
  */
 static bool
-shareinput_mutator_xslice_4(Node *node, ApplyShareInputContext *ctxt, bool fPop)
+shareinput_mutator_xslice_4(Node *node, PlannerGlobal *glob, bool fPop)
 {
+	ApplyShareInputContext *ctxt = &glob->share;
 	Plan *plan = (Plan *) node;
 	int motId = shareinput_peekmot(ctxt);
 
@@ -2202,56 +2533,18 @@ shareinput_mutator_xslice_4(Node *node, ApplyShareInputContext *ctxt, bool fPop)
 	return true;
 }
 
-static void gpmon_pushplannode(ApplyShareInputContext *ctxt, Plan *plan)
-{
-	ctxt->planNodes = lcons(plan, ctxt->planNodes);
-}
-static void gpmon_popplannode(ApplyShareInputContext *ctxt)
-{
-	list_delete_first(ctxt->planNodes);
-}
-static Plan *gpmon_peekplannode(ApplyShareInputContext *ctxt)
-{
-	return ctxt->planNodes == NULL ? NULL : linitial(ctxt->planNodes);
-}
-
-static bool assign_plannode_id_walker(Node *node, ApplyShareInputContext *ctxt, bool fPop)
-{
-	Plan *p = (Plan *) node;
-	Plan *parent;
-
-	if(fPop)
-	{
-		gpmon_popplannode(ctxt);
-		return false;
-	}
-
-	p->plan_node_id = ++ctxt->nextPlanId;
-
-	parent = gpmon_peekplannode(ctxt);
-
-	if(!parent)
-		p->plan_parent_node_id = -1;
-	else
-		p->plan_parent_node_id = parent->plan_node_id;
-
-	gpmon_pushplannode(ctxt, p);
-	return true;
-}
-
 Plan *
 apply_shareinput_xslice(Plan *plan, PlannerGlobal *glob)
 {
 	ApplyShareInputContext *ctxt = &glob->share;
 	ListCell *lp;
 
-	ctxt->sharedNodes = NULL;
-	ctxt->sliceMarks = NULL;
 	ctxt->motStack = NULL;
 	ctxt->qdShares = NULL;
 	ctxt->qdSlices = NULL;
-	ctxt->planNodes = NIL;
 	ctxt->nextPlanId = 0;
+
+	ctxt->sliceMarks = palloc0(ctxt->producer_count * sizeof(int));
 
 	shareinput_pushmot(ctxt, 0);
 
@@ -2270,31 +2563,31 @@ apply_shareinput_xslice(Plan *plan, PlannerGlobal *glob)
 	foreach (lp, glob->subplans)
 	{
 		Plan	   *subplan = (Plan *) lfirst(lp);
-		shareinput_walker(shareinput_mutator_xslice_1, (Node *) subplan, ctxt);
+		shareinput_walker(shareinput_mutator_xslice_1, (Node *) subplan, glob);
 	}
-	shareinput_walker(shareinput_mutator_xslice_1, (Node *) plan, ctxt);
+	shareinput_walker(shareinput_mutator_xslice_1, (Node *) plan, glob);
 
 	/* Now walk the tree again, and process all the consumers. */
 	foreach (lp, glob->subplans)
 	{
 		Plan	   *subplan = (Plan *) lfirst(lp);
-		shareinput_walker(shareinput_mutator_xslice_2, (Node *) subplan, ctxt);
+		shareinput_walker(shareinput_mutator_xslice_2, (Node *) subplan, glob);
 	}
-	shareinput_walker(shareinput_mutator_xslice_2, (Node *) plan, ctxt);
+	shareinput_walker(shareinput_mutator_xslice_2, (Node *) plan, glob);
 
 	foreach (lp, glob->subplans)
 	{
 		Plan	   *subplan = (Plan *) lfirst(lp);
-		shareinput_walker(shareinput_mutator_xslice_3, (Node *) subplan, ctxt);
+		shareinput_walker(shareinput_mutator_xslice_3, (Node *) subplan, glob);
 	}
-	shareinput_walker(shareinput_mutator_xslice_3, (Node *) plan, ctxt);
+	shareinput_walker(shareinput_mutator_xslice_3, (Node *) plan, glob);
 
 	foreach (lp, glob->subplans)
 	{
 		Plan	   *subplan = (Plan *) lfirst(lp);
-		shareinput_walker(shareinput_mutator_xslice_4, (Node *) subplan, ctxt);
+		shareinput_walker(shareinput_mutator_xslice_4, (Node *) subplan, glob);
 	}
-	shareinput_walker(shareinput_mutator_xslice_4, (Node *) plan, ctxt);
+	shareinput_walker(shareinput_mutator_xslice_4, (Node *) plan, glob);
 
 	return plan;
 }
@@ -2304,16 +2597,16 @@ apply_shareinput_xslice(Plan *plan, PlannerGlobal *glob)
  */
 void assign_plannode_id(PlannedStmt *stmt)
 {
-	ApplyShareInputContext ctxt;
+	assign_plannode_id_walker_context ctxt;
 
 	/* We only care about planNodes and nextPlanId, so initialize them. */
 	ctxt.planNodes = NIL;
 	ctxt.nextPlanId = 0;
-	
-	leftdeep_walker(assign_plannode_id_walker, (Node *) stmt->planTree, &ctxt);
-	
+
+	assign_plannode_id_walker((Node *) stmt->planTree, &ctxt);
+
 	ctxt.planNodes = NIL;
-	
+
 	ListCell *lc = NULL;
 	foreach (lc, stmt->subplans)
 	{
@@ -2322,7 +2615,7 @@ void assign_plannode_id(PlannedStmt *stmt)
 
 		ctxt.planNodes = NIL;
 
-		leftdeep_walker(assign_plannode_id_walker, (Node *) subplan, &ctxt);
+		assign_plannode_id_walker((Node *) subplan, &ctxt);
 	}
 }
 
@@ -2435,7 +2728,7 @@ Plan *zap_trivial_result(PlannerInfo *root, Plan *plan)
 int32 
 cdbhash_const(Const *pconst, int iSegments)
 {
-	CdbHash *pcdbhash = makeCdbHash(iSegments, HASH_FNV_1);
+	CdbHash *pcdbhash = makeCdbHash(iSegments);
 	cdbhashinit(pcdbhash);
 			
 	if (pconst->constisnull)
@@ -2464,7 +2757,7 @@ cdbhash_const_list(List *plConsts, int iSegments)
 {
 	Assert(0 < list_length(plConsts));
 	
-	CdbHash *pcdbhash = makeCdbHash(iSegments, HASH_FNV_1);
+	CdbHash *pcdbhash = makeCdbHash(iSegments);
 	cdbhashinit(pcdbhash);
 
 	ListCell   *lc = NULL;
@@ -2562,7 +2855,9 @@ static bool find_params_walker(Node *node, find_params_context *context)
  * Remove unused initplans. This may happen if an initplan has been created, but
  * its corresponding param has been removed because of contradiction detection
  */
-static void remove_unused_initplans_helper(Plan *plan, Bitmapset **usedParams, Bitmapset *rte_params)
+static void
+remove_unused_initplans_helper(Plan *plan, Bitmapset **usedParams, Bitmapset *rte_params,
+							   PlannerInfo *root)
 {
 	if (NULL == plan || IsA(plan, ValuesScan) || IsA(plan, FunctionScan))
 	{
@@ -2579,7 +2874,7 @@ static void remove_unused_initplans_helper(Plan *plan, Bitmapset **usedParams, B
 
 		foreach(lc, l)
 		{
-			remove_unused_initplans_helper(lfirst(lc), usedParams, rte_params);
+			remove_unused_initplans_helper(lfirst(lc), usedParams, rte_params, root);
 		}
 
 		return;
@@ -2673,17 +2968,17 @@ static void remove_unused_initplans_helper(Plan *plan, Bitmapset **usedParams, B
 	if (IsA(plan, Append))
 	{
 		Append *app = (Append *) plan;
-		remove_unused_initplans_helper((Plan *) app->appendplans, &(context.paramids), rte_params);
+		remove_unused_initplans_helper((Plan *) app->appendplans, &(context.paramids), rte_params, root);
 	}
 	else if (IsA(plan, SubqueryScan))
 	{
 		SubqueryScan *subq = (SubqueryScan *) plan;
-		remove_unused_initplans_helper(subq->subplan, &(context.paramids), rte_params);
+		remove_unused_initplans_helper(subq->subplan, &(context.paramids), rte_params, root);
 	}
 	else
 	{
-		remove_unused_initplans_helper(plan->lefttree, &(context.paramids), rte_params);
-		remove_unused_initplans_helper(plan->righttree, &(context.paramids), rte_params);
+		remove_unused_initplans_helper(plan->lefttree, &(context.paramids), rte_params, root);
+		remove_unused_initplans_helper(plan->righttree, &(context.paramids), rte_params, root);
 	}
 
 	if (NIL != plan->initPlan)
@@ -2716,7 +3011,24 @@ static void remove_unused_initplans_helper(Plan *plan, Bitmapset **usedParams, B
 			if (anyused)
 				newInitPlans = lappend(newInitPlans, initplan);
 			else
-				elog(DEBUG2, "removing unused InitPlan %s", initplan->plan_name);
+			{
+				/*
+				 * This init plan is unused. Leave it out of this plan node's
+				 * initPlan list, and also replace it in the global list of
+				 * subplans with a dummy. (We can't just remove it from the
+				 * global list, because that would screw up the plan_id
+				 * numbering of the subplans).
+				 */
+				ListCell *plancell = list_nth_cell(root->glob->subplans, initplan->plan_id-1);
+				ListCell *rtablecell = list_nth_cell(root->glob->subrtables, initplan->plan_id-1);
+
+				lfirst(plancell) = make_result(root, NIL,
+											   (Node *) list_make1(makeBoolConst(false, false)),
+											   NULL);;
+				lfirst(rtablecell) = NIL;
+
+				pfree(initplan);
+			}
 		}
 
 		/* remove unused params */
@@ -2803,8 +3115,365 @@ void remove_unused_initplans(Plan *plan, PlannerInfo *root)
 
 	/* now do the actual cleanup */
 	Bitmapset *params = NULL;
-	remove_unused_initplans_helper(plan, &params, rte_params);
+	remove_unused_initplans_helper(plan, &params, rte_params, root);
 	bms_free(params);
 	bms_free(rte_params);
 }
 
+Node *
+planner_make_plan_constant(struct PlannerInfo *root, Node *n, bool is_SRI)
+{
+	pre_dispatch_function_evaluation_context pcontext;
+
+	planner_init_plan_tree_base(&pcontext.base, root);
+	pcontext.single_row_insert = is_SRI;
+
+	return plan_tree_mutator(n, pre_dispatch_function_evaluation_mutator, &pcontext);
+}
+
+/*
+ * Evaluate functions to constants.
+ */
+Node *
+exec_make_plan_constant(struct PlannedStmt *stmt, bool is_SRI, List **cursorPositions)
+{
+	pre_dispatch_function_evaluation_context pcontext;
+	Node	   *result;
+
+	Assert(stmt);
+	exec_init_plan_tree_base(&pcontext.base, stmt);
+	pcontext.single_row_insert = is_SRI;
+	pcontext.cursorPositions = NIL;
+
+	result = pre_dispatch_function_evaluation_mutator((Node *) stmt->planTree, &pcontext);
+
+	*cursorPositions = pcontext.cursorPositions;
+	return result;
+}
+
+/*
+ * Remove subquery field in RTE's with subquery kind.
+ */
+void
+remove_subquery_in_RTEs(Node *node)
+{
+    if (node == NULL)
+    {
+        return;
+    }
+
+    if (IsA(node, RangeTblEntry))
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) node;
+
+        if (RTE_SUBQUERY == rte->rtekind && NULL != rte->subquery)
+        {
+			/*
+			 * Replace subquery with a dummy subquery.
+			 *
+			 * XXX: We could save a lot more memory by deep-freeing the many
+			 * fields in the Query too. But I'm not sure which of them might
+			 * be shared by other objects in the tree.
+			 */
+			pfree(rte->subquery);
+			rte->subquery = makeNode(Query);
+        }
+
+        return;
+    }
+
+    if (IsA(node, List))
+    {
+        List *list = (List *) node;
+        ListCell *lc = NULL;
+		
+		foreach(lc, list)
+        {
+            remove_subquery_in_RTEs((Node *) lfirst(lc));
+        }
+    }
+}
+
+#define GP_PARTITION_SELECTION_OID 6084
+#define GP_PARTITION_EXPANSION_OID 6085
+#define GP_PARTITION_INVERSE_OID 6086
+ 
+/*
+ * Let's evaluate all STABLE functions that have constant args before
+ * dispatch, so we get a consistent view across QEs
+ *
+ * Also, if this is a single_row insert, let's evaluate nextval() and
+ * currval() before dispatching
+ */
+static Node *
+pre_dispatch_function_evaluation_mutator(Node *node,
+										 pre_dispatch_function_evaluation_context *context)
+{
+	Node * new_node = 0;
+	
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Param))
+	{
+		Param *param = (Param *) node;
+
+		/* Not replaceable, so just copy the Param (no need to recurse) */
+		return (Node *) copyObject(param);
+	}
+	else if (IsA(node, FuncExpr))
+	{
+		FuncExpr *expr = (FuncExpr *) node;
+		List *args;
+		ListCell *arg;
+		Expr *simple;
+		FuncExpr *newexpr;
+		bool has_nonconst_input;
+
+		Form_pg_proc funcform;
+		EState *estate;
+		ExprState *exprstate;
+		MemoryContext oldcontext;
+		Datum const_val;
+		bool const_is_null;
+		int16 resultTypLen;
+		bool resultTypByVal;
+
+		Oid	funcid;
+		HeapTuple func_tuple;
+
+		/*
+		 * Reduce constants in the FuncExpr's arguments. We know args is
+		 * either NIL or a List node, so we can call expression_tree_mutator
+		 * directly rather than recursing to self.
+		 */
+		args = (List *) expression_tree_mutator((Node *) expr->args,
+												pre_dispatch_function_evaluation_mutator,
+												(void *) context);
+										
+		funcid = expr->funcid;
+
+		newexpr = makeNode(FuncExpr);
+		newexpr->funcid = expr->funcid;
+		newexpr->funcresulttype = expr->funcresulttype;
+		newexpr->funcretset = expr->funcretset;
+		newexpr->funcformat = expr->funcformat;
+		newexpr->args = args;
+
+		/*
+		 * Check for constant inputs
+		 */
+		has_nonconst_input = false;
+		
+		foreach(arg, args)
+		{
+			if (!IsA(lfirst(arg), Const))
+			{
+				has_nonconst_input = true;
+				break;
+			}
+		}
+		
+		if (!has_nonconst_input)
+		{
+			bool is_seq_func = false;
+			bool tup_or_set;
+			cqContext *pcqCtx;
+
+			pcqCtx = caql_beginscan(NULL,
+									cql("SELECT * FROM pg_proc " " WHERE oid = :1 ", ObjectIdGetDatum(funcid)));
+
+			func_tuple = caql_getnext(pcqCtx);
+
+			if (!HeapTupleIsValid(func_tuple))
+				elog(ERROR, "cache lookup failed for function %u", funcid);
+
+			funcform = (Form_pg_proc) GETSTRUCT(func_tuple);
+
+			/* can't handle set returning or row returning functions */
+			tup_or_set = (funcform->proretset || type_is_rowtype(funcform->prorettype));
+
+			caql_endscan(pcqCtx);
+			
+			/* can't handle it */
+			if (tup_or_set)
+			{
+				/* 
+				 * We haven't mutated this node, but we still return the
+				 * mutated arguments.
+				 *
+				 * If we don't do this, we'll miss out on transforming function
+				 * arguments which are themselves functions we need to mutated.
+				 * For example, select foo(now()).
+				 */
+				return (Node *)newexpr;
+			}
+
+			/* 
+			 * Ignored evaluation of gp_partition stable functions.
+			 * TODO: refactor gp_partition stable functions to be truly
+			 * stable
+			 */
+			if (funcid == GP_PARTITION_SELECTION_OID 
+				|| funcid == GP_PARTITION_EXPANSION_OID 
+				|| funcid == GP_PARTITION_INVERSE_OID)
+			{
+				return (Node *)newexpr;
+			}
+
+			/* 
+			 * Here we want to mark any statement that is
+			 * going to use a sequence as dirty.  Doing this means that the
+			 * QD will flush the xlog which will also flush any xlog writes that
+			 * the sequence server might do. 
+			 */
+			if (funcid == NEXTVAL_FUNC_OID || funcid == CURRVAL_FUNC_OID ||
+				funcid == SETVAL_FUNC_OID)
+			{
+				ExecutorMarkTransactionUsesSequences();
+				is_seq_func = true;
+			}
+
+			if (funcform->provolatile == PROVOLATILE_IMMUTABLE)
+				/* okay */ ;
+			else if (funcform->provolatile == PROVOLATILE_STABLE)
+				/* okay */ ;
+			else if (context->single_row_insert && is_seq_func)
+				;/* Volatile, but special sequence function */
+			else
+				return (Node *)newexpr;
+
+			/*
+			 * Ok, we have a function that is STABLE (or IMMUTABLE), with
+			 * constant args. Let's try to evaluate it.
+			 */
+
+			/*
+			 * To use the executor, we need an EState.
+			 */
+			estate = CreateExecutorState();
+
+			/* We can use the estate's working context to avoid memory leaks. */
+			oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+
+			/*
+			 * Prepare expr for execution.
+			 */
+			exprstate = ExecPrepareExpr((Expr *) newexpr, estate);
+
+			/*
+			 * And evaluate it.
+			 *
+			 * It is OK to use a default econtext because none of the
+			 * ExecEvalExpr() code used in this situation will use econtext.
+			 * That might seem fortuitous, but it's not so unreasonable --- a
+			 * constant expression does not depend on context, by definition,
+			 * n'est-ce pas?
+			 */
+			const_val = ExecEvalExprSwitchContext(exprstate,
+												  GetPerTupleExprContext(estate),
+												  &const_is_null, NULL);
+
+			/* Get info needed about result datatype */
+			get_typlenbyval(expr->funcresulttype, &resultTypLen, &resultTypByVal);
+
+			/* Get back to outer memory context */
+			MemoryContextSwitchTo(oldcontext);
+
+			/* Must copy result out of sub-context used by expression eval */
+			if (!const_is_null)
+				const_val = datumCopy(const_val, resultTypByVal, resultTypLen);
+
+			/* Release all the junk we just created */
+			FreeExecutorState(estate);
+
+			/*
+			 * Make the constant result node.
+			 */
+			simple = (Expr *) makeConst(expr->funcresulttype, -1, resultTypLen,
+										const_val, const_is_null,
+										resultTypByVal);
+
+			/* successfully simplified it */
+			if (simple)
+				return (Node *) simple;
+		}
+
+		/*
+		 * The expression cannot be simplified any further, so build and
+		 * return a replacement FuncExpr node using the possibly-simplified
+		 * arguments.
+		 */
+		return (Node *) newexpr;
+	}
+	else if (IsA(node, OpExpr))
+	{
+		OpExpr *expr = (OpExpr *) node;
+		List *args;
+
+		OpExpr *newexpr;
+
+		/*
+		 * Reduce constants in the OpExpr's arguments.  We know args is either
+		 * NIL or a List node, so we can call expression_tree_mutator directly
+		 * rather than recursing to self.
+		 */
+		args = (List *) expression_tree_mutator((Node *) expr->args,
+												pre_dispatch_function_evaluation_mutator,
+												(void *) context);
+
+		/*
+		 * Need to get OID of underlying function.	Okay to scribble on input
+		 * to this extent.
+		 */
+		set_opfuncid(expr);
+
+		newexpr = makeNode(OpExpr);
+		newexpr->opno = expr->opno;
+		newexpr->opfuncid = expr->opfuncid;
+		newexpr->opresulttype = expr->opresulttype;
+		newexpr->opretset = expr->opretset;
+		newexpr->args = args;
+
+		return (Node *) newexpr;
+	}
+	else if (IsA(node, CurrentOfExpr))
+	{
+		/*
+		 * updatable cursors
+		 *
+		 * During constant folding, we collect the current position of
+		 * each cursor mentioned in the plan into a list, and dispatch
+		 * them to the QEs.
+		 */
+		CurrentOfExpr *expr = (CurrentOfExpr *) node;
+		CursorPosInfo *cpos;
+
+		cpos = makeNode(CursorPosInfo);
+		cpos->cursor_name = expr->cursor_name;
+
+		/*
+		 * Passing a NULL econtext is Ok in this instance since getCurrentOf()
+		 * will pull out the cursor name from the CurrentOfExpr node.
+		 */
+		getCurrentOf(expr,
+					 NULL /* econtext */,
+					 expr->target_relid,
+					 &cpos->ctid,
+					 &cpos->gp_segment_id,
+					 &cpos->table_oid);
+
+		context->cursorPositions = lappend(context->cursorPositions, cpos);
+	}
+
+	/*
+	 * For any node type not handled above, we recurse using
+	 * plan_tree_mutator, which will copy the node unchanged but try to
+	 * simplify its arguments (if any) using this routine.
+	 */
+	new_node = plan_tree_mutator(node,
+								 pre_dispatch_function_evaluation_mutator,
+								 (void *) context);
+
+	return new_node;
+}

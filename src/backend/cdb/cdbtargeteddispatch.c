@@ -19,7 +19,7 @@
 #include "catalog/pg_proc.h"
 #include "utils/syscache.h"
 
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 #include "cdb/cdbhash.h"        /* isGreenplumDbHashable() */
 #include "cdb/cdbllize.h"
 #include "cdb/cdbmutate.h"
@@ -249,7 +249,7 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 				/* don't bother for ones which will likely hash to many segments */
 				totalCombinations < GpIdentity.numsegments * 3 )
 		{
-			CdbHash *h = makeCdbHash(GpIdentity.numsegments, HASH_FNV_1);
+			CdbHash *h = makeCdbHash(GpIdentity.numsegments);
 			long index = 0;
 
 			result.dd.isDirectDispatch = true;

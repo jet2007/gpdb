@@ -8,11 +8,11 @@
  *-------------------------------------------------------------------------
  */
 
-#include <postgres.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include "utils/workfile_mgr.h"
+#include "postgres.h"
+
 #include "cdb/cdbvars.h"
+#include "utils/faultinjector.h"
+#include "utils/workfile_mgr.h"
 
 static void retrieve_file_no(workfile_set *work_set, uint32 file_no, char *workfile_name, uint32 workfile_name_len);
 static void update_workset_size(workfile_set *work_set, bool delOnClose, bool created, int64 size);
@@ -53,6 +53,8 @@ workfile_mgr_create_fileno(workfile_set *work_set, uint32 file_no)
 			true /* del_on_close */,
 			work_set->metadata.bfz_compress_type);
 
+	SIMPLE_FAULT_INJECTOR(WorkfileCreationFail);
+
 	ExecWorkfile_SetWorkset(ewfile, work_set);
 
 	return ewfile;
@@ -79,18 +81,6 @@ workfile_mgr_open_fileno(workfile_set *work_set, uint32 file_no)
 	ExecWorkfile_SetWorkset(ewfile, work_set);
 
 	return ewfile;
-}
-
-/*
- * Opens a given workfile of a given set
- *
- *  The exact file_name given is used to open the file
- */
-ExecWorkFile *
-workfile_mgr_open_filename(workfile_set *work_set, const char *file_name)
-{
-	Assert(false);
-	return NULL;
 }
 
 /*

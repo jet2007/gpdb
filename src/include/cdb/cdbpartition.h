@@ -95,9 +95,6 @@ add_part_to_catalog(Oid relid, PartitionBy *pby, bool bTemplate_Only);
 extern void parruleord_reset_rank(Oid partid, int2 level, Oid parent,
 					  int2 ruleord);
 
-extern void parruleord_open_gap(Oid partid, int2 level, Oid parent,
-					int2 ruleord, int stopkey, bool closegap);
-
 extern AttrNumber 
 max_partition_attr(PartitionNode *pn);
 
@@ -166,10 +163,10 @@ extern Oid selectPartition(PartitionNode *partnode, Datum *values,
 						   PartitionAccessMethods *accessMethods);
 
 extern Node *atpxPartAddList(Relation rel, 
-							 AlterPartitionCmd *pc,
+							 bool is_split,
+							 List *colencs,
 							 PartitionNode *pNode, 
-							 Node *pUtl,
-							 Node *partName, 
+							 char *partName,
 							 bool isDefault,
 							 PartitionElem *pelem,
 							 PartitionByType part_type,

@@ -7,7 +7,8 @@
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL$
+ * IDENTIFICATION
+ *    src/backend/commands/queue.c
  *
  *-------------------------------------------------------------------------
  */
@@ -23,7 +24,7 @@
 #include "catalog/pg_resqueue.h"
 #include "nodes/makefuncs.h"
 #include "cdb/cdbvars.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/queue.h"
@@ -347,10 +348,7 @@ AlterResqueueCapabilityEntry(
 
 		/* WITHOUT clause value determined in pg_resourcetype */
 		if (!bWithout)
-		{
-			bool need_free_value = false;
-			pStrVal = makeString(defGetString(defel, &need_free_value));
-		}
+			pStrVal = makeString(defGetString(defel));
 		else
 		{
 			pStrVal = NULL; /* if NULL, delete entry from
@@ -774,17 +772,6 @@ CreateQueue(CreateQueueStmt *stmt)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to create resource queues")));
 
-	/*
-	 * MPP-7960: We cannot run CREATE RESOURCE QUEUE inside a user
-	 * transaction block because the shared memory structures are not
-	 * cleaned up on abort, resulting in "leaked", unreachable queues.
-	 */
-
-	if (Gp_role == GP_ROLE_DISPATCH)
-	{
-		PreventTransactionChain((void *) stmt, "CREATE RESOURCE QUEUE");
-	}
-
 	/* Extract options from the statement node tree */
 	foreach(option, stmt->options)
 	{
@@ -1035,7 +1022,11 @@ CreateQueue(CreateQueueStmt *stmt)
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
 		stmt->queueOid = queueid;
-		CdbDispatchUtilityStatement((Node *) stmt, "CreateResourceQueue");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 		MetaTrackAddObject(ResQueueRelationId,
 						   queueid,
 						   GetUserId(), /* not ownerid */
@@ -1095,17 +1086,6 @@ AlterQueue(AlterQueueStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to alter resource queues")));
-
-	/*
-	 * MPP-7960: We cannot run ALTER RESOURCE QUEUE inside a user
-	 * transaction block because the shared memory structures are not
-	 * cleaned up on abort, resulting in "leaked", unreachable queues.
-	 */
-
-	if (Gp_role == GP_ROLE_DISPATCH)
-	{
-		PreventTransactionChain((void *) stmt, "ALTER RESOURCE QUEUE");
-	}
 
 	/* Extract options from the statement node tree */
 	foreach(option, stmt->options)
@@ -1474,7 +1454,11 @@ AlterQueue(AlterQueueStmt *stmt)
 	/* MPP-6929, MPP-7583: metadata tracking */
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "AlterResourceQueue");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 		MetaTrackUpdObject(ResQueueRelationId,
 						   queueid,
 						   GetUserId(), /* not ownerid */
@@ -1611,7 +1595,11 @@ DropQueue(DropQueueStmt *stmt)
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		CdbDispatchUtilityStatement((Node *) stmt, "DropResourceQueue");
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NULL);
 	}
 	/* MPP-6929, MPP-7583: metadata tracking */
 	MetaTrackDropObject(ResQueueRelationId,

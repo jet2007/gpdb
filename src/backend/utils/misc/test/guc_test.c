@@ -232,8 +232,6 @@ test__set_config_option(void **state)
 	bool ret;
 	ret = set_config_option("password_encryption", "off", PGC_POSTMASTER, PGC_S_SESSION, false, false);
 	assert_true(ret);
-	ret = set_config_option("gp_disable_catalog_access_on_segment", "on", PGC_POSTMASTER, PGC_S_SESSION, false, false);
-	assert_true(ret);
 }
 
 /*
@@ -245,16 +243,16 @@ test__find_option(void **state)
 	build_guc_variables();
 
 	struct config_generic *config;
-	config = find_option("unknown_name", LOG);
+	config = find_option("unknown_name", false, LOG);
 	assert_null(config);
 
-	config = find_option("password_encryption", LOG);
+	config = find_option("password_encryption", false, LOG);
 	assert_not_null(config);
-	config = find_option("gp_resqueue_priority_cpucores_per_segment", LOG);
+	config = find_option("gp_resqueue_priority_cpucores_per_segment", false, LOG);
 	assert_not_null(config);
 
 	/* supported obsolete guc name */
-	config = find_option("work_mem", LOG);
+	config = find_option("work_mem", false, LOG);
 	assert_not_null(config);
 }
 

@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/init/postinit.c,v 1.174 2007/02/15 23:23:23 alvherre Exp $
+ *	  $PostgreSQL: pgsql/src/backend/utils/init/postinit.c,v 1.180.2.1 2008/09/11 14:01:35 alvherre Exp $
  *
  *
  *-------------------------------------------------------------------------
@@ -50,14 +50,16 @@
 #include "utils/flatfiles.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/plancache.h"
 #include "utils/portal.h"
 #include "utils/ps_status.h"
 #include "utils/relcache.h"
 #include "utils/resscheduler.h"
+#include "utils/sharedsnapshot.h"
 #include "utils/syscache.h"
-#include "utils/tqual.h"  		/* SharedSnapshot */
 #include "pgstat.h"
 #include "utils/session_state.h"
+#include "codegen/codegen_wrapper.h"
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
@@ -68,6 +70,11 @@ static void InitCommunication(void);
 static void ShutdownPostgres(int code, Datum arg);
 static bool ThereIsAtLeastOneRole(void);
 static void process_startup_options(Port *port, bool am_superuser);
+
+#ifdef USE_ORCA
+extern void InitGPOPT();
+extern void TerminateGPOPT();
+#endif
 
 
 /*** InitPostgres support ***/
@@ -308,53 +315,16 @@ ProcessRoleGUC(void)
 	{
 		ArrayType  *a = DatumGetArrayTypeP(datum);
 
-		ProcessGUCArray(a, PGC_S_USER);
+		/*
+		 * We process all the options at SUSET level.  We assume that the
+		 * right to insert an option into pg_authid was checked when it was
+		 * inserted.
+		 */
+		ProcessGUCArray(a, PGC_SUSET, PGC_S_USER, GUC_ACTION_SET);
 	}
 
 	caql_endscan(pcqCtx);
 }
-
-/*
- * FindMyDatabaseByOid
- *
- * As above, but the actual database Id is known.  Return its name and the 
- * tablespace OID.  Return TRUE if found, FALSE if not.  The same restrictions
- * as FindMyDatabase apply.
- */
-static bool
-FindMyDatabaseByOid(Oid dbid, char *dbname, Oid *db_tablespace)
-{
-	bool		result = false;
-	char	   *filename;
-	FILE	   *db_file;
-	Oid			db_id;
-	char		thisname[NAMEDATALEN];
-	TransactionId db_frozenxid;
-
-	filename = database_getflatfilename();
-	db_file = AllocateFile(filename, "r");
-	if (db_file == NULL)
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", filename)));
-
-	while (read_pg_database_line(db_file, thisname, &db_id,
-								 db_tablespace, &db_frozenxid))
-	{
-		if (dbid == db_id)
-		{
-			result = true;
-			strlcpy(dbname, thisname, NAMEDATALEN);
-			break;
-		}
-	}
-
-	FreeFile(db_file);
-	pfree(filename);
-
-	return result;
-}
-
 
 /*
  * CheckMyDatabase -- fetch information from the pg_database entry for our DB
@@ -465,7 +435,12 @@ CheckMyDatabase(const char *name, bool am_superuser)
 		{
 			ArrayType  *a = DatumGetArrayTypeP(datum);
 
-			ProcessGUCArray(a, PGC_S_DATABASE);
+			/*
+			 * We process all the options at SUSET level.  We assume that the
+			 * right to insert an option into pg_database was checked when it
+			 * was inserted.
+			 */
+			ProcessGUCArray(a, PGC_SUSET, PGC_S_DATABASE, GUC_ACTION_SET);
 		}
 	}
 
@@ -578,6 +553,9 @@ BaseInit(void)
 	InitFileAccess();
 	smgrinit();
 	InitBufferPoolAccess();
+
+	/* Initialize llvm library if USE_CODEGEN is defined */
+	init_codegen();
 }
 
 
@@ -625,6 +603,11 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	/* Initialize memory protection */
 	GPMemoryProtect_Init();
 
+#ifdef USE_ORCA
+	/* Initialize GPOPT */
+	InitGPOPT();
+#endif
+
 	/*
 	 * Initialize my entry in the shared-invalidation manager's array of
 	 * per-backend data.
@@ -661,6 +644,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 */
 	RelationCacheInitialize();
 	InitCatalogCache();
+	InitPlanCache();
 
 	/* Initialize portal manager */
 	EnablePortalManager();
@@ -994,10 +978,6 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	{
 		addSharedSnapshot("Query Dispatcher", gp_session_id);
 	}
-	else if (Gp_role == GP_ROLE_DISPATCHAGENT)
-	{
-		SharedLocalSnapshotSlot = NULL;
-	}
     else if (Gp_segment == -1 && Gp_role == GP_ROLE_EXECUTE && !Gp_is_writer)
     {
 		/* 
@@ -1114,6 +1094,10 @@ ShutdownPostgres(int code, Datum arg)
 	 * our usage, report now.
 	 */
 	ReportOOMConsumption();
+
+#ifdef USE_ORCA
+  TerminateGPOPT();
+#endif
 
 	/* Disable memory protection */
 	GPMemoryProtect_Shutdown();

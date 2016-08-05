@@ -644,7 +644,7 @@ static Size est_hash_tuple_size(TupleTableSlot *hashslot, List *hash_needed)
 		
 		Assert( !attr->attisdropped );
 		
-		len = att_align(len, attr->attalign);
+		len = att_align_nominal(len, attr->attalign);
 		len += get_typavgwidth(attr->atttypid, attr->atttypmod);
 	}
 
@@ -817,7 +817,7 @@ agg_hash_initial_pass(AggState *aggstate)
 		}
 
 		/* set up for advance_aggregates call */
-		tmpcontext->ecxt_scantuple = outerslot;
+		tmpcontext->ecxt_outertuple = outerslot;
 
 		/* Find or (if there's room) build a hash table entry for the
 		 * input tuple's group. */
@@ -1198,7 +1198,7 @@ spill_hash_table(AggState *aggstate)
 	/* Spill set does not have a workfile_set. Use existing or create new one as needed */
 	if (hashtable->work_set == NULL)
 	{
-		hashtable->work_set = workfile_mgr_create_set(BFZ, true /* can_be_reused */, &aggstate->ss.ps, NULL_SNAPSHOT);
+		hashtable->work_set = workfile_mgr_create_set(BFZ, true /* can_be_reused */, &aggstate->ss.ps);
 		hashtable->work_set->metadata.buckets = hashtable->nbuckets;
 		//aggstate->workfiles_created = true;
 	}
@@ -1583,7 +1583,7 @@ agg_hash_reload(AggState *aggstate)
 		has_tuples = true;
 
 		/* set up for advance_aggregates call */
-		tmpcontext->ecxt_scantuple = aggstate->hashslot;
+		tmpcontext->ecxt_outertuple = aggstate->hashslot;
 
 		entry = lookup_agg_hash_entry(aggstate, input, INPUT_RECORD_GROUP_AND_AGGS, input_size,
 									  hashkey, reloaded_hash_bit, &isNew);
@@ -1992,21 +1992,6 @@ void destroy_agg_hash_table(AggState *aggstate)
 		pfree(aggstate->hhashtable);
 		aggstate->hhashtable = NULL;
 	}
-}
-
-/*
- * Marks workfile set as complete
- */
-void
-agg_hash_mark_spillset_complete(AggState *aggstate)
-{
-
-	Assert(aggstate != NULL);
-	Assert(aggstate->hhashtable != NULL);
-	Assert(aggstate->hhashtable->work_set != NULL);
-
-	workfile_set *work_set = aggstate->hhashtable->work_set;
-	workfile_mgr_mark_complete(work_set);
 }
 
 /* EOF */

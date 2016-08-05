@@ -317,13 +317,7 @@ FileRepAckPrimary_RunReceiver(void)
 			break;
 		}		
 		
-#ifdef FAULT_INJECTOR
-		FaultInjector_InjectFaultIfSet(
-									   FileRepReceiver,
-									   DDLNotSpecified,
-									   "",	//databaseName
-									   ""); // tableName
-#endif				
+		SIMPLE_FAULT_INJECTOR(FileRepReceiver);
 		
 		fileRepShmemMessageDescr = 
 		(FileRepShmemMessageDescr_s*) msgPositionInsert;	
@@ -351,13 +345,6 @@ FileRepAckPrimary_RunReceiver(void)
 							   spareField,
 							   FILEREP_UNDEFINED);			
 		
-		if (Debug_filerep_print)
-			ereport(LOG,
-					(errmsg("P_RunReceiver ack msg header count '%d' ",
-							spareField),
-					 FileRep_errdetail_ShmemAck(),
-					 FileRep_errcontext()));				
-				
 	} // while(1)
 	
 	FileRepConnServer_CloseConnection();
@@ -1044,13 +1031,7 @@ FileRepAckPrimary_RunConsumer(void)
 			break;
 		}
 		
-#ifdef FAULT_INJECTOR
-		FaultInjector_InjectFaultIfSet(
-									   FileRepConsumer,
-									   DDLNotSpecified,
-									   "",	//databaseName
-									   ""); // tableName
-#endif				
+		SIMPLE_FAULT_INJECTOR(FileRepConsumer);
 		
 		/* Calculate and compare FileRepMessageHeader_s Crc */
 		fileRepMessageHeader = (FileRepMessageHeader_s*) (fileRepAckShmem->positionConsume + 
@@ -1189,18 +1170,6 @@ FileRepAckPrimary_RunConsumer(void)
 							   FILEREP_UNDEFINED,
 							   fileRepMessageHeader->messageCount);				
 		
-		if (Debug_filerep_print)
-			ereport(LOG,
-				(errmsg("P_RunConsumer ack msg header count '%d' ack state '%s' ",
-						fileRepMessageHeader->messageCount,
-						FileRepAckStateToString[fileRepMessageHeader->fileRepAckState]),
-				 FileRep_errdetail(fileRepMessageHeader->fileRepIdentifier,
-								   fileRepMessageHeader->fileRepRelationType,
-								   fileRepMessageHeader->fileRepOperation,
-								   fileRepMessageHeader->messageCount),
-				 FileRep_errdetail_ShmemAck(),
-				 FileRep_errcontext()));		
-
 		if (status != STATUS_OK) {
 			break;
 		}

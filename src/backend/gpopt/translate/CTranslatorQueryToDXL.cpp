@@ -31,7 +31,6 @@
 #include "gpopt/translate/CQueryMutators.h"
 #include "gpopt/translate/CTranslatorUtils.h"
 #include "gpopt/translate/CTranslatorQueryToDXL.h"
-#include "gpopt/translate/CTranslatorPlStmtToDXL.h"
 #include "gpopt/translate/CTranslatorDXLToPlStmt.h"
 #include "gpopt/translate/CTranslatorRelcacheToDXL.h"
 
@@ -418,15 +417,6 @@ CTranslatorQueryToDXL::CheckSupportedCmdType
 		return;
 	}
 
-	if (CMD_INSERT == pquery->commandType || CMD_DELETE == pquery->commandType || CMD_UPDATE == pquery->commandType)
-	{
-		if (NULL != pquery->resultRelations)
-		{
-			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature, GPOS_WSZ_LIT("DML on partitioned tables"));
-		}
-		return;
-	}
-
 	SCmdNameElem rgStrMap[] =
 		{
 		{CMD_UTILITY, GPOS_WSZ_LIT("UTILITY command")}
@@ -441,8 +431,6 @@ CTranslatorQueryToDXL::CheckSupportedCmdType
 			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature, mapelem.m_wsz);
 		}
 	}
-
-	GPOS_ASSERT(!"Unrecognized command type");
 }
 
 //---------------------------------------------------------------------------
@@ -485,6 +473,11 @@ CTranslatorQueryToDXL::PdrgpdxlnCTE() const
 CDXLNode *
 CTranslatorQueryToDXL::PdxlnFromQueryInternal()
 {
+	// The parsed query contains an RTE for the view, which is maintained all the way through planned statement.
+	// This entries is annotated as requiring SELECT permissions for the current user.
+	// In Orca, we only keep range table entries for the base tables in the planned statement, but not for the view itself.
+	// Since permissions are only checked during ExecutorStart, we lose track of the permissions required for the view and the select goes through successfully.
+	// We therefore need to check permissions before we go into optimization for all RTEs, including the ones not explicitly referred in the query, e.g. views.
 	CTranslatorUtils::CheckRTEPermissions(m_pquery->rtable);
 	
 	CDXLNode *pdxlnChild = NULL;
@@ -687,14 +680,15 @@ CTranslatorQueryToDXL::PdxlnInsert()
 		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature, GPOS_WSZ_LIT("INSERT with constraints"));
 	}
 	
-	const ULONG ulLenTblCols = pmdrel->UlColumns() - pmdrel->UlSystemColumns();
+	const ULONG ulLenTblCols = CTranslatorUtils::UlNonSystemColumns(pmdrel);
 	const ULONG ulLenTL = gpdb::UlListLength(m_pquery->targetList);
 	GPOS_ASSERT(ulLenTblCols >= ulLenTL);
 	GPOS_ASSERT(ulLenTL == m_pdrgpdxlnQueryOutput->UlLength());
 
 	CDXLNode *pdxlnPrL = NULL;
 	
-	const ULONG ulLenNonDroppedCols = pmdrel->UlNonDroppedCols() - pmdrel->UlSystemColumns();
+	const ULONG ulSystemCols = pmdrel->UlColumns() - ulLenTblCols;
+	const ULONG ulLenNonDroppedCols = pmdrel->UlNonDroppedCols() - ulSystemCols;
 	if (ulLenNonDroppedCols > ulLenTL)
 	{
 		// missing target list entries
@@ -1005,14 +999,10 @@ CTranslatorQueryToDXL::PstrExtractOptionValue
 	GPOS_ASSERT(NULL != pdefelem);
 
 	BOOL fNeedsFree = false;
-	CHAR *szValue = gpdb::SzDefGetString(pdefelem, &fNeedsFree);
+	CHAR *szValue = gpdb::SzDefGetString(pdefelem);
 
 	CWStringDynamic *pstrResult = CDXLUtils::PstrFromSz(m_pmp, szValue);
 	
-	if (fNeedsFree)
-	{
-		gpdb::GPDBFree(szValue);
-	}
 	
 	return pstrResult;
 }

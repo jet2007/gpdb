@@ -2852,7 +2852,7 @@ create table child_r
  -- issue MPP-7898.
 insert into child_r values
     (0, 'from r', 0, 0);
-    
+
 drop table if exists parent_s cascade; --ignore
 drop table if exists child_r cascade; --ignore
 
@@ -3690,7 +3690,60 @@ select * from deep_part_1_prt_female_2_prt_5_3_prt_5;
 insert into deep_part values (9, 9, 10, 'F');
 select * from deep_part;
 
+-- Incorrect relation OID in pg_partition_oid()
+select pg_partition_oid(1, deep_part.*) from deep_part;
+
 drop table input2;
 drop table input1;
 drop table part_tab;
 drop table deep_part;
+
+-- Avoid TupleDesc leak when COPY partition table from files
+drop table if exists pt_td_leak;
+CREATE TABLE pt_td_leak
+(
+col1 int,
+col2 int,
+col3 int
+)
+distributed by (col1)
+partition by range(col2)
+(
+    partition part1 start(1) end(5),
+    partition part2 start(5) end(10)
+);
+
+insert into pt_td_leak select i,i,i from generate_series(1,9) i;
+copy pt_td_leak to '/tmp/pt_td_leak.out' csv;
+
+alter table pt_td_leak drop column col3;
+alter table pt_td_leak add column col3 int default 7;
+
+drop table if exists pt_td_leak_exchange;
+CREATE TABLE pt_td_leak_exchange ( col1 int, col2 int, col3 int) distributed by (col1);
+alter table pt_td_leak exchange partition part2 with table pt_td_leak_exchange;
+
+insert into pt_td_leak values(1,8,1);
+copy pt_td_leak from '/tmp/pt_td_leak.out' with delimiter ',';
+
+select * from pt_td_leak where col1 = 5;
+
+drop table pt_td_leak;
+drop table pt_td_leak_exchange;
+
+-- Test split default partition while per tuple memory context is reset
+drop table if exists test_split_part cascade;
+
+CREATE TABLE test_split_part ( log_id int NOT NULL, f_array int[] NOT NULL)
+DISTRIBUTED BY (log_id)
+PARTITION BY RANGE(log_id)
+(
+	START (1::int) END (100::int) EVERY (5) WITH (appendonly=false),
+	PARTITION "Old" START (101::int) END (201::int) WITH (appendonly=false),
+	DEFAULT PARTITION other_log_ids  WITH (appendonly=false)
+);
+
+insert into test_split_part (log_id , f_array) select id, '{10}' from generate_series(1,1000) id;
+
+ALTER TABLE test_split_part SPLIT DEFAULT PARTITION START (201) INCLUSIVE END (301) EXCLUSIVE INTO (PARTITION "New", DEFAULT PARTITION);
+

@@ -1517,13 +1517,21 @@ static void
 PLy_function_delete_args(PLyProcedure *proc)
 {
 	int			i;
+	PyObject	*arg;
 
 	if (!proc->argnames)
 		return;
 
 	for (i = 0; i < proc->nargs; i++)
-		if (proc->argnames[i])
-			PyDict_DelItemString(proc->globals, proc->argnames[i]);
+		if (proc->argnames[i]) {
+			arg = PyString_FromString(proc->argnames[i]);
+
+			/* Deleting the item only if it exists in the dictionaty */
+			if (PyDict_Contains(proc->globals, arg)) {
+				PyDict_DelItem(proc->globals, arg);
+			}
+			Py_DECREF(arg);
+		}
 }
 
 /*
@@ -2045,12 +2053,12 @@ PLy_procedure_munge_source(const char *name, const char *src)
 				}
 			}
 
-			pyelog(INFO, "After searching the start of the string, index is: %d sf is: %d endquote is: %c", i, sf, cendquote); 
+			pyelog(INFO, "After searching the start of the string, index is: %d sf is: %d endquote is: %c", (int)i, sf, cendquote);
 
 			/* now copy all characters to the destination buffer if we see the beginning of a string */ 
 			while (sf != STRING_BEGIN_NOT_YET && sf != STRING_SEEN_END && i < olen)
 			{
-				pyelog(INFO, "copying src[%d]=%c", i, src[i]); 
+				pyelog(INFO, "copying src[%d]=%c", (int)i, src[i]);
 
 				BOUNDED_PTR_ASSIGN_INC(mp, mrc + mlen, src[i]); 
 
@@ -2079,7 +2087,7 @@ PLy_procedure_munge_source(const char *name, const char *src)
 				i++; 
 			}
 
-			pyelog(INFO, "After searching the END of the string, index is: %d sf is: %d", i, sf); 
+			pyelog(INFO, "After searching the END of the string, index is: %d sf is: %d", (int)i, sf);
 
 			if (i == olen) 
 				break; 
@@ -2158,7 +2166,6 @@ PLy_input_tuple_funcs(PLyTypeInfo *arg, TupleDesc desc)
 
 	if (arg->is_rowtype == 0)
 		elog(ERROR, "PLyTypeInfo struct is initialized for a Datum");
-
 	arg->is_rowtype = 1;
 
 	if (arg->in.r.natts != desc->natts)
@@ -2549,6 +2556,9 @@ PLyList_FromArray(PLyDatumToOb *arg, Datum d)
 	int			length;
 	int			lbound;
 	int			i;
+	char		*dataptr;
+	bits8		*bitmap;
+	int			bitmask;
 
 	if (ARR_NDIM(array) == 0)
 		return PyList_New(0);
@@ -2563,23 +2573,38 @@ PLyList_FromArray(PLyDatumToOb *arg, Datum d)
 	lbound = ARR_LBOUND(array)[0];
 	list = PyList_New(length);
 
+	dataptr = ARR_DATA_PTR(array);
+	bitmap = ARR_NULLBITMAP(array);
+	bitmask = 1;
+
 	for (i = 0; i < length; i++)
 	{
-		Datum		elem;
-		bool		isnull;
-		int			offset;
-
-		offset = lbound + i;
-		elem = array_ref(array, 1, &offset, arg->typlen,
-						 elm->typlen, elm->typbyval, elm->typalign,
-						 &isnull);
-		if (isnull)
+		/* Get source element, checking for NULL */
+		if (bitmap && (*bitmap & bitmask) == 0)
 		{
 			Py_INCREF(Py_None);
 			PyList_SET_ITEM(list, i, Py_None);
 		}
 		else
-			PyList_SET_ITEM(list, i, elm->func(elm, elem));
+		{
+			Datum		itemvalue;
+
+			itemvalue = fetch_att(dataptr, elm->typbyval, elm->typlen);
+			PyList_SET_ITEM(list, i, elm->func(elm, itemvalue));
+			dataptr = att_addlength_pointer(dataptr, elm->typlen, dataptr);
+			dataptr = (char *) att_align_nominal(dataptr, elm->typalign);
+		}
+
+		/* advance bitmap pointer if any */
+		if (bitmap)
+		{
+			bitmask <<= 1;
+			if (bitmask == 0x100 /* (1<<8) */)
+			{
+				bitmap++;
+				bitmask = 1;
+			}
+		}
 	}
 
 	return list;

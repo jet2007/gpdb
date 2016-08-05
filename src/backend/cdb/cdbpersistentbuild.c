@@ -466,7 +466,8 @@ static void PersistentBuild_PopulateGpRelationNode(
 			gp_relation_node,
 			gp_relation_node_index,
 			indexInfo,
-			false);
+			false,
+			true);
 
 	DirectOpen_GpRelationNodeIndexClose(gp_relation_node_index);
 
@@ -591,6 +592,7 @@ PersistentBuild_BuildDb(
 	info = DatabaseInfo_Collect(
 							dbOid,
 							defaultTablespace,
+							/* snapshot */ NULL,
 							/* collectGpRelationNodeInfo */ false,
 							/* collectAppendOnlyCatalogSegmentInfo */ true,
 							/* scanFileSystem */ true);
@@ -625,13 +627,7 @@ PersistentBuild_BuildDb(
 
 	gp_before_persistence_work = false;
 
-#ifdef FAULT_INJECTOR
-	FaultInjector_InjectFaultIfSet(
-								   RebuildPTDB,
-								   DDLNotSpecified,
-								   "",	// databaseName
-								   ""); // tableName
-#endif
+	SIMPLE_FAULT_INJECTOR(RebuildPTDB);
 
 	/* 
 	 * Since we have written XLOG records with <persistentTid,
@@ -639,7 +635,7 @@ PersistentBuild_BuildDb(
 	 * GUC, lets do a checkpoint to force out all buffer pool pages so we never
 	 * try to redo those XLOG records in Crash Recovery.
 	 */
-	CreateCheckPoint(false, true);
+	CreateCheckPoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 	return count;
 }

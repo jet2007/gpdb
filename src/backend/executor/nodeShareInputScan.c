@@ -25,13 +25,12 @@
 #include "cdb/cdbvars.h"
 #include "executor/executor.h"
 #include "executor/nodeShareInputScan.h"
-
-#include "utils/tuplestorenew.h"
 #include "miscadmin.h"
-
-#include "utils/debugbreak.h"
-#include "utils/tuplesort.h"
 #include "postmaster/primary_mirror_mode.h"
+#include "utils/faultinjector.h"
+#include "utils/gp_alloc.h"
+#include "utils/tuplesort.h"
+#include "utils/tuplestorenew.h"
 
 typedef struct ShareInput_Lk_Context
 {
@@ -212,11 +211,11 @@ ShareInputNext(ShareInputScanState *node)
 		{
 			if(gp_enable_mk_sort)
 			{
-				gotOK = tuplesort_gettupleslot_pos_mk(node->ts_state->sortstore_mk, (TuplesortPos_mk *)node->ts_pos, forward, slot);
+				gotOK = tuplesort_gettupleslot_pos_mk(node->ts_state->sortstore_mk, (TuplesortPos_mk *)node->ts_pos, forward, slot, CurrentMemoryContext);
 			}
 			else
 			{
-				gotOK = tuplesort_gettupleslot_pos(node->ts_state->sortstore, (TuplesortPos *)node->ts_pos, forward, slot);
+				gotOK = tuplesort_gettupleslot_pos(node->ts_state->sortstore, (TuplesortPos *)node->ts_pos, forward, slot, CurrentMemoryContext);
 			}
 		}
 
@@ -225,6 +224,8 @@ ShareInputNext(ShareInputScanState *node)
 
 		Gpmon_M_Incr_Rows_Out(GpmonPktFromShareInputState(node)); 
 		CheckSendPlanStateGpmonPkt(&node->ss.ps);
+
+		SIMPLE_FAULT_INJECTOR(ExecShareInputNext);
 
 		return slot;
 	}
@@ -267,8 +268,8 @@ ExecInitShareInputScan(ShareInputScan *node, EState *estate, int eflags)
 	outerPlanState(sisstate) = ExecInitNode(outerPlan, estate, eflags);
 
 	sisstate->ss.ps.targetlist = (List *) 
-		ExecInitExpr((Expr *) node->plan.targetlist, (PlanState *) sisstate);
-	Assert(node->plan.qual == NULL);
+		ExecInitExpr((Expr *) node->scan.plan.targetlist, (PlanState *) sisstate);
+	Assert(node->scan.plan.qual == NULL);
 	sisstate->ss.ps.qual = NULL;
 
 	/* Misc initialization 
@@ -291,7 +292,7 @@ ExecInitShareInputScan(ShareInputScan *node, EState *estate, int eflags)
 		if (!ExecContextForcesOids(&sisstate->ss.ps, &hasoid))
 			hasoid = false;
 
-		tupDesc = ExecTypeFromTL(node->plan.targetlist, hasoid);
+		tupDesc = ExecTypeFromTL(node->scan.plan.targetlist, hasoid);
 	}
 		
 	ExecAssignScanType(&sisstate->ss, tupDesc);
@@ -487,7 +488,7 @@ void ExecShareInputScanReScan(ShareInputScanState *node, ExprContext *exprCtxt)
 
 /*************************************************************************
  * XXX 
- * we need some IPC mechanism for shareinptu_read_wait/writer_notify.  Semaphore is
+ * we need some IPC mechanism for shareinput_read_wait/writer_notify.  Semaphore is
  * the first thing come to mind but it turns out postgres is very picky about
  * how to use semaphore and we do not want to mess up with it.
  *
@@ -542,43 +543,46 @@ static void sisc_lockname(char* p, int size, int share_id, const char* name)
 
 static void shareinput_clean_lk_ctxt(ShareInput_Lk_Context *lk_ctxt)
 {
-	int err;
-
 	elog(DEBUG1, "shareinput_clean_lk_ctxt cleanup lk ctxt %p", lk_ctxt);
 
-	if(lk_ctxt->readyfd >= 0)
-	{
-		err = gp_retry_close(lk_ctxt->readyfd);
-		insist_log(!err, "shareinput_clean_lk_ctxt cannot close readyfd: %m");
+	if (!lk_ctxt)
+		return;
 
-		lk_ctxt->readyfd = -1;
+	if (lk_ctxt->readyfd >= 0)
+	{
+		if (gp_retry_close(lk_ctxt->readyfd))
+			ereport(WARNING,
+				(errcode(ERRCODE_IO_ERROR),
+				errmsg("shareinput_clean_lk_ctxt cannot close readyfd: %m")));
 	}
 
-	if(lk_ctxt->donefd >= 0)
+	if (lk_ctxt->donefd >= 0)
 	{
-		err = gp_retry_close(lk_ctxt->donefd);
-		insist_log(!err, "shareinput_clean_lk_ctxt cannot close donefd: %m");
-
-		lk_ctxt->donefd = -1;
+		if (gp_retry_close(lk_ctxt->donefd))
+			ereport(WARNING,
+				(errcode(ERRCODE_IO_ERROR),
+				errmsg("shareinput_clean_lk_ctxt cannot close donefd: %m")));
 	}
 
-	if(lk_ctxt->del_ready && lk_ctxt->lkname_ready[0])
+	if (lk_ctxt->del_ready && lk_ctxt->lkname_ready[0])
 	{
-		err = unlink(lk_ctxt->lkname_ready);
-		insist_log(!err, "shareinput_clean_lk_ctxt cannot unlink \"%s\": %m", lk_ctxt->lkname_ready);
-
-		lk_ctxt->del_ready = false;
+		if (unlink(lk_ctxt->lkname_ready))
+			ereport(WARNING,
+				(errcode(ERRCODE_IO_ERROR),
+				errmsg("shareinput_clean_lk_ctxt cannot unlink \"%s\": %m",
+					lk_ctxt->lkname_ready)));
 	}
 
-	if(lk_ctxt->del_done && lk_ctxt->lkname_done[0])
+	if (lk_ctxt->del_done && lk_ctxt->lkname_done[0])
 	{
-		err = unlink(lk_ctxt->lkname_done);
-		insist_log(!err, "shareinput_clean_lk_ctxt cannot unline \"%s\": %m", lk_ctxt->lkname_done);
-
-		lk_ctxt->del_done = false;
+		if (unlink(lk_ctxt->lkname_done))
+			ereport(WARNING,
+				(errcode(ERRCODE_IO_ERROR),
+				errmsg("shareinput_clean_lk_ctxt cannot unlink \"%s\": %m",
+					lk_ctxt->lkname_done)));
 	}
 
-	gp_free2 (lk_ctxt, sizeof(ShareInput_Lk_Context));
+	gp_free(lk_ctxt);
 }
 
 static void XCallBack_ShareInput_FIFO(XactEvent ev, void* vp)
@@ -815,8 +819,8 @@ shareinput_writer_notifyready(int share_id, int xslice, PlanGenerator planGen)
 	pctxt->del_ready = true;
 	pctxt->readyfd = open(pctxt->lkname_ready, O_RDWR, 0600); 
 	if(pctxt->readyfd < 0)
-	
 		elog(ERROR, "could not open fifo \"%s\": %m", pctxt->lkname_ready);
+
 	sisc_lockname(pctxt->lkname_done, MAXPGPATH, share_id, "done");
 	create_tmp_fifo(pctxt->lkname_done);
 	pctxt->del_done = true;

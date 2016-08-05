@@ -9,7 +9,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/copy.c,v 1.279 2007/03/29 00:15:38 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/copy.c,v 1.295 2008/01/01 19:45:48 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -38,6 +38,7 @@
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
+#include "executor/execDML.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
@@ -60,7 +61,6 @@
 #include "cdb/cdbhash.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbsreh.h"
-#include "cdb/cdbrelsize.h"
 #include "cdb/cdbutil.h"
 #include "cdb/cdbvarblock.h"
 #include "cdb/cdbbufferedappend.h"
@@ -462,9 +462,7 @@ CopySendEndOfRow(CopyState cstate)
 			return; /* don't want to reset msgbug quite yet */
 	}
 
-	/* Reset fe_msgbuf to empty */
-	fe_msgbuf->len = 0;
-	fe_msgbuf->data[0] = '\0';
+	resetStringInfo(fe_msgbuf);
 }
 
 /*
@@ -510,9 +508,7 @@ CopyToDispatchFlush(CopyState cstate)
 
 	}
 
-	/* Reset fe_msgbuf to empty */
-	fe_msgbuf->len = 0;
-	fe_msgbuf->data[0] = '\0';
+	resetStringInfo(fe_msgbuf);
 }
 
 
@@ -1170,12 +1166,9 @@ DoCopyInternal(const CopyStmt *stmt, const char *queryString, CopyState cstate)
 
 			fstat(fileno(cstate->copy_file), &st);
 			if (S_ISDIR(st.st_mode))
-			{
-				FreeFile(cstate->copy_file);
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("\"%s\" is a directory", cstate->filename)));
-			}
 		}
 
 	}
@@ -1224,12 +1217,11 @@ DoCopyInternal(const CopyStmt *stmt, const char *queryString, CopyState cstate)
 	}
 	else
 	{
-		Query	   *query = stmt->query;
 		List	   *rewritten;
-		PlannedStmt	 *plannedstmt;
+		Query	   *query;
+		PlannedStmt *plan;
 		DestReceiver *dest;
 
-		Assert(query);
 		Assert(!is_from);
 		cstate->rel = NULL;
 
@@ -1239,34 +1231,18 @@ DoCopyInternal(const CopyStmt *stmt, const char *queryString, CopyState cstate)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("COPY (SELECT) WITH OIDS is not supported")));
 
-		if (query->intoClause)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("COPY (SELECT INTO) is not supported")));
-
-
 		/*
-		 * The query has already been through parse analysis, but not
-		 * rewriting or planning.  Do that now.
+		 * Run parse analysis and rewrite.	Note this also acquires sufficient
+		 * locks on the source table(s).
 		 *
-		 * Because the planner is not cool about not scribbling on its input,
-		 * we make a preliminary copy of the source querytree.  This prevents
+		 * Because the parser and planner tend to scribble on their input, we
+		 * make a preliminary copy of the source querytree.  This prevents
 		 * problems in the case that the COPY is in a portal or plpgsql
 		 * function and is executed repeatedly.  (See also the same hack in
-												  * EXPLAIN, DECLARE CURSOR and PREPARE.)  XXX the planner really
-		 * shouldn't modify its input ... FIXME someday.
+		 * DECLARE CURSOR and PREPARE.)  XXX FIXME someday.
 		 */
-		query = copyObject(query);
-		Assert(query->commandType == CMD_SELECT);
-
-		/*
-		 * Must acquire locks in case we didn't come fresh from the parser.
-		 * XXX this also scribbles on query, another reason for copyObject
-		 */
-		AcquireRewriteLocks(query);
-
-		/* Rewrite through rule system */
-		rewritten = QueryRewrite(query);
+		rewritten = pg_analyze_and_rewrite((Node *) copyObject(stmt->query),
+										   queryString, NULL, 0);
 
 		/* We don't expect more or less than one result query */
 		if (list_length(rewritten) != 1)
@@ -1274,9 +1250,16 @@ DoCopyInternal(const CopyStmt *stmt, const char *queryString, CopyState cstate)
 
 		query = (Query *) linitial(rewritten);
 		Assert(query->commandType == CMD_SELECT);
+		Assert(query->utilityStmt == NULL);
+
+		/* Query mustn't use INTO, either */
+		if (query->intoClause)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("COPY (SELECT INTO) is not supported")));
 
 		/* plan the query */
-		plannedstmt = planner(query, 0, NULL);
+		plan = planner(query, 0, NULL);
 
 		/*
 		 * Update snapshot command ID to ensure this query sees results of any
@@ -1285,14 +1268,14 @@ DoCopyInternal(const CopyStmt *stmt, const char *queryString, CopyState cstate)
 		 * which COPY can be invoked, I think it's OK, because the active
 		 * snapshot shouldn't be shared with anything else anyway.)
 		 */
-		ActiveSnapshot->curcid = GetCurrentCommandId();
+		ActiveSnapshot->curcid = GetCurrentCommandId(false);
 
 		/* Create dest receiver for COPY OUT */
 		dest = CreateDestReceiver(DestCopyOut, NULL);
 		((DR_copy *) dest)->cstate = cstate;
 
 		/* Create a QueryDesc requesting no output */
-		cstate->queryDesc = CreateQueryDesc(plannedstmt, queryString,
+		cstate->queryDesc = CreateQueryDesc(plan, queryString,
 											ActiveSnapshot, InvalidSnapshot,
 											dest, NULL, false);
 
@@ -1452,12 +1435,9 @@ DoCopyInternal(const CopyStmt *stmt, const char *queryString, CopyState cstate)
 
 			fstat(fileno(cstate->copy_file), &st);
 			if (S_ISDIR(st.st_mode))
-			{
-				FreeFile(cstate->copy_file);
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("\"%s\" is a directory", cstate->filename)));
-			}
 		}
 
 
@@ -1509,7 +1489,7 @@ DoCopyInternal(const CopyStmt *stmt, const char *queryString, CopyState cstate)
 				{
 					SegfileMapNode *n = makeNode(SegfileMapNode);
 					n->relid = RelationGetRelid(cstate->rel);
-					n->segno = SetSegnoForWrite(InvalidFileSegNumber, n->relid);
+					n->segno = SetSegnoForWrite(cstate->rel, InvalidFileSegNumber);
 					cstate->ao_segnos = lappend(cstate->ao_segnos, n);
 				}
 			}
@@ -2807,7 +2787,7 @@ CopyFromDispatch(CopyState cstate)
 		else
 			p_nattrs = 0;
 		/* Create hash API reference */
-		cdbHash = makeCdbHash(cdbCopy->total_segs, HASH_FNV_1);
+		cdbHash = makeCdbHash(cdbCopy->total_segs);
 	}
 
 
@@ -3362,7 +3342,7 @@ CopyFromDispatch(CopyState cstate)
 								save_cxt = MemoryContextSwitchTo(oldcontext);
 								d->relid = relid;
 								part_hash = d->cdbHash =
-									makeCdbHash(cdbCopy->total_segs, HASH_FNV_1);
+									makeCdbHash(cdbCopy->total_segs);
 								part_policy = d->policy =
 									GpPolicyCopy(oldcontext,
 												 rel->rd_cdbpolicy);
@@ -3643,10 +3623,6 @@ CopyFromDispatch(CopyState cstate)
 	if (policy)
 		pfree(policy);
 
-	/* free the hash table allocated by values_get_partition(), if any */
-	if(estate->es_result_partitions && estate->es_partition_state->result_partition_hash != NULL)
-		hash_destroy(estate->es_partition_state->result_partition_hash);
-
 	/*
 	 * Don't worry about the partition table hash map, that will be
 	 * freed when our current memory context is freed. And that will be
@@ -3674,11 +3650,16 @@ CopyFrom(CopyState cstate)
 	int			attnum;
 	int			i;
 	Oid			in_func_oid;
-	Datum	   *values;
-	bool	   *nulls;
+	Datum		*values = NULL;
+	bool		*nulls = NULL;
+	Datum		*partValues = NULL;
+	bool		*partNulls = NULL;
+	Datum		*baseValues = NULL;
+	bool		*baseNulls = NULL;
 	bool		isnull;
 	ResultRelInfo *resultRelInfo;
 	EState	   *estate = CreateExecutorState(); /* for ExecConstraints() */
+	TupleTableSlot *baseSlot;
 	TupleTableSlot *slot;
 	bool		file_has_oids;
 	int		   *defmap;
@@ -3686,7 +3667,7 @@ CopyFrom(CopyState cstate)
 	ExprContext *econtext;		/* used for ExecEvalExpr for default atts */
 	MemoryContext oldcontext = CurrentMemoryContext;
 	ErrorContextCallback errcontext;
-	CommandId	mycid = GetCurrentCommandId();
+	CommandId	mycid = GetCurrentCommandId(true);
 	bool		use_wal = true;		/* by default, use WAL logging */
 	bool		use_fsm = true;		/* by default, use FSM for free space */
 	int		   *attr_offsets;
@@ -3717,13 +3698,6 @@ CopyFrom(CopyState cstate)
 	 * rd_newRelfilenodeSubid can be cleared before the end of the transaction.
 	 * However this is OK since at worst we will fail to make the optimization.
 	 *
-	 * When skipping WAL it's entirely possible that COPY itself will write no
-	 * WAL records at all.  This is of concern because RecordTransactionCommit
-	 * might decide it doesn't need to log our eventual commit, which we
-	 * certainly need it to do.  However, we need no special action here for
-	 * that, because if we have a new table or new relfilenode then there
-	 * must have been a WAL-logged pg_class update earlier in the transaction.
-	 *
 	 * Also, if the target file is new-in-transaction, we assume that checking
 	 * FSM for free space is a waste of time, even if we must use WAL because
 	 * of archiving.  This could possibly be wrong, but it's unlikely.
@@ -3742,6 +3716,8 @@ CopyFrom(CopyState cstate)
 		if (!XLogArchivingActive())
 			use_wal = false;
 	}
+
+	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
 	/*
 	 * We need a ResultRelInfo so we can use the regular executor's
@@ -3768,7 +3744,7 @@ CopyFrom(CopyState cstate)
 	CopyInitPartitioningState(estate);
 
 	/* Set up a tuple slot too */
-	slot = MakeSingleTupleTableSlot(tupDesc);
+	baseSlot = MakeSingleTupleTableSlot(tupDesc);
 
 	econtext = GetPerTupleExprContext(estate);
 
@@ -3827,9 +3803,12 @@ CopyFrom(CopyState cstate)
 
 	file_has_oids = cstate->oids;	/* must rely on user to tell us this... */
 
-	values = (Datum *) palloc(num_phys_attrs * sizeof(Datum));
-	nulls = (bool *) palloc(num_phys_attrs * sizeof(bool));
+	baseValues = (Datum *) palloc(num_phys_attrs * sizeof(Datum));
+	baseNulls = (bool *) palloc(num_phys_attrs * sizeof(bool));
 	attr_offsets = (int *) palloc(num_phys_attrs * sizeof(int));
+
+	partValues = (Datum *) palloc(attr_count * sizeof(Datum));
+	partNulls = (bool *) palloc(attr_count * sizeof(bool));
 
 	/* Set up callback to identify error line number */
 	errcontext.callback = copy_in_error_callback;
@@ -3890,8 +3869,8 @@ CopyFrom(CopyState cstate)
 				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
 				/* Initialize all values for row to NULL */
-				MemSet(values, 0, num_phys_attrs * sizeof(Datum));
-				MemSet(nulls, true, num_phys_attrs * sizeof(bool));
+				MemSet(baseValues, 0, num_phys_attrs * sizeof(Datum));
+				MemSet(baseNulls, true, num_phys_attrs * sizeof(bool));
 				/* reset attribute pointers */
 				MemSet(attr_offsets, 0, num_phys_attrs * sizeof(int));
 
@@ -4006,9 +3985,9 @@ CopyFrom(CopyState cstate)
 				PG_TRY();
 				{
 					if (cstate->csv_mode)
-						CopyReadAttributesCSV(cstate, nulls, attr_offsets, num_phys_attrs, attr);
+						CopyReadAttributesCSV(cstate, baseNulls, attr_offsets, num_phys_attrs, attr);
 					else
-						CopyReadAttributesText(cstate, nulls, attr_offsets, num_phys_attrs, attr);
+						CopyReadAttributesText(cstate, baseNulls, attr_offsets, num_phys_attrs, attr);
 
 					/*
 					 * Loop to read the user attributes on the line.
@@ -4021,7 +4000,7 @@ CopyFrom(CopyState cstate)
 
 						string = cstate->attribute_buf.data + attr_offsets[m];
 
-						if (nulls[m])
+						if (baseNulls[m])
 							isnull = true;
 						else
 							isnull = false;
@@ -4034,11 +4013,11 @@ CopyFrom(CopyState cstate)
 
 						cstate->cur_attname = NameStr(attr[m]->attname);
 
-						values[m] = InputFunctionCall(&in_functions[m],
+						baseValues[m] = InputFunctionCall(&in_functions[m],
 													  isnull ? NULL : string,
 													  typioparams[m],
 													  attr[m]->atttypmod);
-						nulls[m] = isnull;
+						baseNulls[m] = isnull;
 						cstate->cur_attname = NULL;
 					}
 
@@ -4049,11 +4028,11 @@ CopyFrom(CopyState cstate)
 					 */
 					for (i = 0; i < num_defaults; i++)
 					{
-						values[defmap[i]] = ExecEvalExpr(defexprs[i], econtext,
+						baseValues[defmap[i]] = ExecEvalExpr(defexprs[i], econtext,
 														 &isnull, NULL);
 
 						if (!isnull)
-							nulls[defmap[i]] = false;
+							baseNulls[defmap[i]] = false;
 					}
 				}
 				PG_CATCH();
@@ -4074,10 +4053,10 @@ CopyFrom(CopyState cstate)
 				 */
 				PG_TRY();
 				{
-					MemoryContextSwitchTo(oldcontext);
+					MemoryContextSwitchTo(estate->es_query_cxt);
 					if (estate->es_result_partitions)
 					{
-						resultRelInfo = values_get_partition(values, nulls,
+						resultRelInfo = values_get_partition(baseValues, baseNulls,
 															 tupDesc, estate);
 						estate->es_result_relation_info = resultRelInfo;
 					}
@@ -4125,6 +4104,27 @@ CopyFrom(CopyState cstate)
 				/*
 				 * And now we can form the input tuple.
 				 */
+				if (resultRelInfo->ri_partSlot != NULL)
+				{
+					AttrMap *map = resultRelInfo->ri_partInsertMap;
+					Assert(map != NULL);
+
+
+					MemSet(partValues, 0, attr_count * sizeof(Datum));
+					MemSet(partNulls, true, attr_count * sizeof(bool));
+
+					reconstructTupleValues(map, baseValues, baseNulls, (int) num_phys_attrs,
+										   partValues, partNulls, (int) attr_count);
+
+					values = partValues;
+					nulls = partNulls;
+				}
+				else
+				{
+					values = baseValues;
+					nulls = baseNulls;
+				}
+
 				if (relstorage == RELSTORAGE_AOROWS)
 				{
 					/* form a mem tuple */
@@ -4143,7 +4143,7 @@ CopyFrom(CopyState cstate)
 				else
 				{
 					/* form a regular heap tuple */
-					tuple = (HeapTuple) heap_form_tuple(tupDesc, values, nulls);
+					tuple = (HeapTuple) heap_form_tuple(resultRelInfo->ri_RelationDesc->rd_att, values, nulls);
 
 					if (cstate->oids && file_has_oids)
 						HeapTupleSetOid((HeapTuple)tuple, loaded_oid);
@@ -4153,7 +4153,7 @@ CopyFrom(CopyState cstate)
 				/*
 				 * Triggers and stuff need to be invoked in query context.
 				 */
-				MemoryContextSwitchTo(oldcontext);
+				MemoryContextSwitchTo(estate->es_query_cxt);
 
 				/* Partitions don't support triggers yet */
 				Assert(!(estate->es_result_partitions &&
@@ -4189,6 +4189,16 @@ CopyFrom(CopyState cstate)
 				{
 					char relstorage = RelinfoGetStorage(resultRelInfo);
 					
+					if (resultRelInfo->ri_partSlot != NULL)
+					{
+						Assert(resultRelInfo->ri_partInsertMap != NULL);
+						slot = resultRelInfo->ri_partSlot;
+					}
+					else
+					{
+						slot = baseSlot;
+					}
+
 					if (relstorage != RELSTORAGE_AOCOLS)
 					{
 						/* Place tuple in tuple slot */
@@ -4277,7 +4287,7 @@ CopyFrom(CopyState cstate)
 	 */
 	error_context_stack = errcontext.previous;
 
-	MemoryContextSwitchTo(oldcontext);
+	MemoryContextSwitchTo(estate->es_query_cxt);
 
 	/*
 	 * Execute AFTER STATEMENT insertion triggers
@@ -4299,18 +4309,11 @@ CopyFrom(CopyState cstate)
 	if (estate->es_result_partitions && Gp_role == GP_ROLE_EXECUTE)
 		SendAOTupCounts(estate);
 
-	/* free the hash table allocated by values_get_partition(), if any */
-	if(estate->es_result_partitions && estate->es_partition_state->result_partition_hash != NULL)
-		hash_destroy(estate->es_partition_state->result_partition_hash);
-		
-	pfree(attr_offsets);
+	/* NB: do not pfree baseValues/baseNulls and partValues/partNulls here, since
+	 * there may be duplicate free in ExecDropSingleTupleTableSlot; if not, they
+	 * would be freed by FreeExecutorState anyhow */
 
-	pfree(in_functions);
-	pfree(typioparams);
-	pfree(defmap);
-	pfree(defexprs);
-
-	ExecDropSingleTupleTableSlot(slot);
+	ExecDropSingleTupleTableSlot(baseSlot);
 
 	/*
 	 * If we skipped writing WAL, then we need to sync the heap (but not
@@ -4341,6 +4344,8 @@ CopyFrom(CopyState cstate)
 	}
 	
 	cstate->rel = NULL; /* closed above */
+
+	MemoryContextSwitchTo(oldcontext);
 	FreeExecutorState(estate);
 }
 

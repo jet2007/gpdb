@@ -8,7 +8,7 @@
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/heap.h,v 1.86 2007/01/05 22:19:52 momjian Exp $
+ * $PostgreSQL: pgsql/src/include/catalog/heap.h,v 1.87 2008/01/01 19:45:56 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -126,12 +126,9 @@ extern Form_pg_attribute SystemAttributeByName(const char *attname,
 
 extern void CheckAttributeNamesTypes(TupleDesc tupdesc, char relkind);
 
-extern void CheckAttributeType(const char *attname, Oid atttypid);
+extern void CheckAttributeType(const char *attname, Oid atttypid,
+							   List *containing_rowtypes);
 extern void SetRelationNumChecks(Relation rel, int numchecks);
-
-extern Oid setNewRelfilenode(Relation relation);
-
-extern Oid setNewRelfilenodeToOid(Relation relation, Oid newrelfilenode);
 
 /* MPP-6929: metadata tracking */
 extern void MetaTrackAddObject(Oid		classid, 
@@ -152,5 +149,7 @@ extern void MetaTrackDropObject(Oid		classid,
 		|| ((relkind) == RELKIND_INDEX) \
 		|| ((relkind) == RELKIND_SEQUENCE) \
 		|| ((relkind) == RELKIND_VIEW)) 
+
+extern void remove_gp_relation_node_and_schedule_drop(Relation rel);
 
 #endif   /* HEAP_H */

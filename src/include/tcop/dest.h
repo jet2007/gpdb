@@ -54,7 +54,7 @@
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/tcop/dest.h,v 1.53 2007/01/05 22:19:58 momjian Exp $
+ * $PostgreSQL: pgsql/src/include/tcop/dest.h,v 1.54 2008/01/01 19:45:59 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -133,7 +133,6 @@ extern void EndCommand(const char *commandTag, CommandDest dest);
 
 extern void NullCommand(CommandDest dest);
 extern void ReadyForQuery(CommandDest dest);
-extern void ReadyForQuery_QEWriter(CommandDest dest);
 
 extern void sendQEDetails(void);
 

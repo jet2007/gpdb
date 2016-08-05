@@ -7,7 +7,7 @@
  * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/commands/defrem.h,v 1.80 2007/01/23 05:07:18 tgl Exp $
+ * $PostgreSQL: pgsql/src/include/commands/defrem.h,v 1.88.2.1 2010/07/03 13:53:38 rhaas Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -26,7 +26,6 @@ extern void DefineIndex(RangeVar *heapRelation,
 			char *tableSpaceName,
 			List *attributeList,
 			Expr *predicate,
-			List *rangetable,
 			List *options,
 			bool unique,
 			bool primary,
@@ -69,7 +68,8 @@ extern void AlterFunctionNamespace(List *name, List *argtypes, bool isagg,
 					   const char *newschema);
 
 /* commands/operatorcmds.c */
-extern void DefineOperator(List *names, List *parameters, Oid newOid);
+extern void DefineOperator(List *names, List *parameters,
+			   Oid newOid, Oid newCommutatorOid, Oid newNegatorOid);
 extern void RemoveOperator(RemoveFuncStmt *stmt);
 extern void RemoveOperatorById(Oid operOid);
 extern void AlterOperatorOwner(List *name, TypeName *typeName1,
@@ -95,13 +95,47 @@ extern void RemoveAmProcEntryById(Oid entryOid);
 extern void RenameOpClass(List *name, const char *access_method, const char *newname);
 extern void RenameOpFamily(List *name, const char *access_method, const char *newname);
 extern void AlterOpClassOwner(List *name, const char *access_method, Oid newOwnerId);
+extern void AlterOpClassOwner_oid(Oid opclassOid, Oid newOwnerId);
 extern void AlterOpFamilyOwner(List *name, const char *access_method, Oid newOwnerId);
+extern void AlterOpFamilyOwner_oid(Oid opfamilyOid, Oid newOwnerId);
+
+/* commands/tsearchcmds.c */
+extern void DefineTSParser(List *names, List *parameters, Oid newOid);
+extern void RenameTSParser(List *oldname, const char *newname);
+extern void RemoveTSParser(List *names, DropBehavior behavior,
+			   bool missing_ok);
+extern void RemoveTSParserById(Oid prsId);
+
+extern void DefineTSDictionary(List *names, List *parameters, Oid newOid);
+extern void RenameTSDictionary(List *oldname, const char *newname);
+extern void RemoveTSDictionary(List *names, DropBehavior behavior,
+				   bool missing_ok);
+extern void RemoveTSDictionaryById(Oid dictId);
+extern void AlterTSDictionary(AlterTSDictionaryStmt *stmt);
+extern void AlterTSDictionaryOwner(List *name, Oid newOwnerId);
+
+extern void DefineTSTemplate(List *names, List *parameters, Oid newOid);
+extern void RenameTSTemplate(List *oldname, const char *newname);
+extern void RemoveTSTemplate(List *names, DropBehavior behavior,
+				 bool missing_ok);
+extern void RemoveTSTemplateById(Oid tmplId);
+
+extern void DefineTSConfiguration(List *names, List *parameters, Oid newOid);
+extern void RenameTSConfiguration(List *oldname, const char *newname);
+extern void RemoveTSConfiguration(List *names, DropBehavior behavior,
+					  bool missing_ok);
+extern void RemoveTSConfigurationById(Oid cfgId);
+extern void AlterTSConfiguration(AlterTSConfigurationStmt *stmt);
+extern void AlterTSConfigurationOwner(List *name, Oid newOwnerId);
+
+extern text *serialize_deflist(List *deflist);
+extern List *deserialize_deflist(Datum txt);
 
 /* support routines in commands/define.c */
 
 extern char *case_translate_language_name(const char *input);
 
-extern char *defGetString(DefElem *def, bool *need_free);
+extern char *defGetString(DefElem *def);
 extern double defGetNumeric(DefElem *def);
 extern bool defGetBoolean(DefElem *def);
 extern int64 defGetInt64(DefElem *def);

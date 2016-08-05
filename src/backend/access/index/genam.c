@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/index/genam.c,v 1.61 2007/01/20 18:43:35 neilc Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/index/genam.c,v 1.76 2009/08/01 20:59:17 tgl Exp $
  *
  * NOTES
  *	  many of the old access method routines have been turned into
@@ -26,6 +26,8 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/tqual.h"
 
@@ -100,6 +102,9 @@ RelationGetIndexScan(Relation indexRelation,
 	ItemPointerSetInvalid(&scan->xs_ctup.t_self);
 	scan->xs_ctup.t_data = NULL;
 	scan->xs_cbuf = InvalidBuffer;
+	scan->xs_prev_xmax = InvalidTransactionId;
+	scan->xs_next_hot = InvalidOffsetNumber;
+	scan->xs_hot_dead = false;
 
 	/*
 	 * Let the AM fill in the key and any opaque data it wants.
@@ -128,6 +133,59 @@ IndexScanEnd(IndexScanDesc scan)
 		pfree(scan->keyData);
 
 	pfree(scan);
+}
+
+/*
+ * BuildIndexValueDescription
+ *
+ * Construct a string describing the contents of an index entry, in the
+ * form "(key_name, ...)=(key_value, ...)".  This is currently used
+ * only for building unique-constraint error messages, but we don't want
+ * to hardwire the spelling of the messages here.
+ */
+char *
+BuildIndexValueDescription(Relation indexRelation,
+						   Datum *values, bool *isnull)
+{
+	/*
+	 * XXX for the moment we use the index's tupdesc as a guide to the
+	 * datatypes of the values.  This is okay for btree indexes but is in
+	 * fact the wrong thing in general.  This will have to be fixed if we
+	 * are ever to support non-btree unique indexes.
+	 */
+	TupleDesc	tupdesc = RelationGetDescr(indexRelation);
+	StringInfoData buf;
+	int			i;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "(%s)=(",
+					 pg_get_indexdef_columns(RelationGetRelid(indexRelation),
+											 true));
+
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		char   *val;
+
+		if (isnull[i])
+			val = "null";
+		else
+		{
+			Oid		foutoid;
+			bool	typisvarlena;
+
+			getTypeOutputInfo(tupdesc->attrs[i]->atttypid,
+							  &foutoid, &typisvarlena);
+			val = OidOutputFunctionCall(foutoid, values[i]);
+		}
+
+		if (i > 0)
+			appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf, val);
+	}
+
+	appendStringInfoChar(&buf, ')');
+
+	return buf.data;
 }
 
 
@@ -212,7 +270,16 @@ systable_beginscan(Relation heapRelation,
 	}
 	else
 	{
-		sysscan->scan = heap_beginscan(heapRelation, snapshot, nkeys, key);
+		/*
+		 * We disallow synchronized scans when forced to use a heapscan on a
+		 * catalog.  In most cases the desired rows are near the front, so
+		 * that the unpredictable start point of a syncscan is a serious
+		 * disadvantage; and there are no compensating advantages, because
+		 * it's unlikely that such scans will occur in parallel.
+		 */
+		sysscan->scan = heap_beginscan_strat(heapRelation, snapshot,
+											 nkeys, key,
+											 true, false);
 		sysscan->iscan = NULL;
 	}
 

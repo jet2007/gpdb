@@ -1051,7 +1051,7 @@ datumstreamwrite_lob(DatumStreamWrite * acc, Datum d)
 	/*
 	 * If the datum is toasted	/ compressed -- an error.
 	 */
-	if (VARATT_IS_EXTENDED_D(d))
+	if (VARATT_IS_EXTENDED(DatumGetPointer(d)))
 	{
 		elog(ERROR, "Expected large object / variable length objects (varlena) to be de-toasted and/or de-compressed at this point");
 	}
@@ -1059,7 +1059,7 @@ datumstreamwrite_lob(DatumStreamWrite * acc, Datum d)
 	/*
 	 * De-Toast Datum
 	 */
-	if (VARATT_IS_EXTERNAL_D(d))
+	if (VARATT_IS_EXTERNAL(DatumGetPointer(d)))
 	{
 		d = PointerGetDatum(heap_tuple_fetch_attr(DatumGetPointer(d)));
 	}
@@ -1199,13 +1199,8 @@ datumstreamread_block_content(DatumStreamRead * acc)
 				{
 					pfree(acc->large_object_buffer);
 					acc->large_object_buffer = NULL;
-#ifdef FAULT_INJECTOR
-					FaultInjector_InjectFaultIfSet(MallocFailure,
-												   DDLNotSpecified,
-												   "", //databaseName
-												   "");
-					/* tableName */
-#endif
+
+					SIMPLE_FAULT_INJECTOR(MallocFailure);
 				}
 
 				acc->large_object_buffer_size = acc->getBlockInfo.contentLen;

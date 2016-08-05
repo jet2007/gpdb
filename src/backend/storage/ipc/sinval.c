@@ -45,6 +45,9 @@ uint64		SharedInvalidMessageCounter;
 static volatile int catchupInterruptEnabled = 0;
 static volatile int catchupInterruptOccurred = 0;
 
+/* Are we currently processing a catchup event? */
+volatile int in_process_catchup_event = 0;
+
 static void ProcessCatchupEvent(void);
 
 
@@ -304,10 +307,21 @@ static void
 ProcessCatchupEvent(void)
 {
 	bool		notify_enabled;
+	bool		client_wait_timeout_enabled;
 	DtxContext  saveDistributedTransactionContext;
 
-	/* Must prevent notify interrupt while I am running */
+	/*
+	 * Funny indentation to keep the code inside identical to upstream
+	 * while at the same time supporting CMockery which has problems with
+	 * multiple bracing on column 1.
+	 */
+	PG_TRY();
+	{
+	in_process_catchup_event = 1;
+
+	/* Must prevent SIGUSR2 and SIGALRM(for IdleSessionGangTimeout) interrupt while I am running */
 	notify_enabled = DisableNotifyInterrupt();
+	client_wait_timeout_enabled = DisableClientWaitTimeoutInterrupt();
 
 	/*
 	 * What we need to do here is cause ReceiveSharedInvalidMessages() to run,
@@ -345,4 +359,16 @@ ProcessCatchupEvent(void)
 
 	if (notify_enabled)
 		EnableNotifyInterrupt();
+
+	if (client_wait_timeout_enabled)
+		EnableClientWaitTimeoutInterrupt();
+
+	in_process_catchup_event = 0;
+	}
+	PG_CATCH();
+	{
+		in_process_catchup_event = 0;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }

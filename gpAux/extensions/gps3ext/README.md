@@ -1,15 +1,24 @@
 ## Build
 
-`make` to build the extension for GPDB.
+`make -B` to build the extension for GPDB.
+
+`make -B gpcheckcloud` to build `gpcheckcloud`.
 
 ## Test
 
 ### Run Unit Tests
 
-`make -f Makefile.test test`
-
-Some tests need [unite](https://github.com/lij55/unite) to serve the test contents and recevie log.
+`make test`
 
 ### Test Code Coverage
 
-`make -f Makefile.test coverage`
+`make coverage`
+
+## Coding Style
+
+Based on Google C++ style, especially:
+
+- No tabs, 4 spaces only.
+- CamelCase for classes, camelCase for methods and variables.
+- Avoid pointers, use references as much as possible, unless returning NULL.
+- Use exceptions properly, instead of checking returning values everywhere.

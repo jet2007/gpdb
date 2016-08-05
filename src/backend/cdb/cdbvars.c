@@ -19,7 +19,9 @@
 #include "catalog/gp_segment_config.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbfts.h"
+#include "cdb/cdbdisp.h"
 #include "cdb/cdbutil.h"
+#include "cdb/cdbdisp.h"
 #include "lib/stringinfo.h"
 #include "libpq/libpq-be.h"
 #include "utils/memutils.h"
@@ -49,14 +51,8 @@ bool		Gp_is_writer; 		/* is this qExec a "writer" process. */
 
 int 		gp_session_id;    /* global unique id for session. */
 
-
 char		*qdHostname;		/*QD hostname */
 int			qdPostmasterPort;	/*Master Segment Postmaster port. */
-char       *gp_qd_callback_info;	/* info for QE to call back to QD */
-
-bool 		gp_is_callback;		/* are we executing a callback query? */
-
-bool		gp_use_dispatch_agent;	/* Use experimental code for Query Dispatch Agent */
 
 int         gp_command_count;          /* num of commands from client */
 
@@ -67,8 +63,6 @@ bool		Debug_print_prelim_plan;	/* Shall we log argument of
 bool		Debug_print_slice_table;	/* Shall we log the slice table? */
 
 bool		Debug_print_dispatch_plan;	/* Shall we log the plan we'll dispatch? */
-
-bool		Debug_print_plannedstmt;	/* Shall we log the final planned statement? */
 
 bool            gp_backup_directIO = false;     /* disable\enable direct I/O dump */
 
@@ -172,14 +166,6 @@ bool	gp_enable_slow_writer_testmode = false;
  */
 bool	gp_enable_slow_cursor_testmode = false;
 
-/*
- * gp_enable_delete_as_truncate
- *
- * piggy-back a truncate on simple delete statements (statements
- * without qualifiers "delete from foo").
- */
-bool	gp_enable_delete_as_truncate = false;
-
 /**
  * Hash-join node releases hash table when it returns last tuple.
  */
@@ -215,7 +201,7 @@ int			Gp_interconnect_hash_multiplier=2;	/* sets the size of the hash table used
 
 int			interconnect_setup_timeout=7200;
 
-int			Gp_interconnect_type = INTERCONNECT_TYPE_TCP;
+int			Gp_interconnect_type = INTERCONNECT_TYPE_UDPIFC;
 
 bool		gp_interconnect_aggressive_retry=true; /* fast-track app-level retry */
 
@@ -310,7 +296,6 @@ bool		gp_enable_motion_deadlock_sanity = FALSE; /* planning time sanity check */
 #ifdef USE_ASSERT_CHECKING
 bool		gp_mk_sort_check = false;
 #endif
-bool 		trace_sort = false;
 int			gp_sort_flags = 0;
 int			gp_dbg_flags = 0;
 int 		gp_sort_max_distinct = 20000;
@@ -479,10 +464,6 @@ string_to_role(const char *string)
 	{
 		role = GP_ROLE_EXECUTE;
 	}
-	else if (pg_strcasecmp(string, "dispatchagent") == 0 || pg_strcasecmp(string, "qda") == 0)
-	{
-		role = GP_ROLE_DISPATCHAGENT;
-	}
 	else if (pg_strcasecmp(string, "utility") == 0)
 	{
 		role = GP_ROLE_UTILITY;
@@ -505,8 +486,6 @@ role_to_string(GpRoleValue role)
 			return "dispatch";
 		case GP_ROLE_EXECUTE:
 			return "execute";
-		case GP_ROLE_DISPATCHAGENT:
-			return "dispatchagent";
 		case GP_ROLE_UTILITY:
 			return "utility";
 		case GP_ROLE_UNDEFINED:
@@ -554,7 +533,7 @@ assign_gp_session_role(const char *newval, bool doit, GucSource source __attribu
 
 
 /*
- * Assign hook routine for "gp_role" option.  This variablle has context
+ * Assign hook routine for "gp_role" option.  This variable has context
  * PGC_SUSET so that is can only be set by a superuser via the SET command.
  * (It can also be set using an option on postmaster start, but this isn't
  * interesting beccause the derived global CdbRole is always set (along with
@@ -636,7 +615,7 @@ assign_gp_role(const char *newval, bool doit, GucSource source)
 
 
 /*
- * Assign hook routine for "gp_connections_per_thread" option.  This variablle has context
+ * Assign hook routine for "gp_connections_per_thread" option.  This variable has context
  * PGC_SUSET so that is can only be set by a superuser via the SET command.
  * (It can also be set in config file, but not inside of PGOPTIONS.)
  *
@@ -656,46 +635,13 @@ assign_gp_connections_per_thread(int newval, bool doit, GucSource source __attri
 		if (newval < 0)
 			return false;
 
+		cdbdisp_setAsync(newval == 0);
+		cdbgang_setAsync(newval == 0);
 		gp_connections_per_thread = newval;
 	}
 
 	return true;
 }
-
-/*
- * Assign hook routine for "assign_gp_use_dispatch_agent" option.  This variable has context
- * PGC_USERSET
- *
- * See src/backend/util/misc/guc.c for option definition.
- */
-void disconnectAndDestroyAllGangs(void);
-
-bool
-assign_gp_use_dispatch_agent(bool newval, bool doit, GucSource source __attribute__((unused)) )
-{
-
-
-	if (newval != gp_use_dispatch_agent && doit)
-		elog(LOG, "assign_gp_use_dispatch_agent: gp_use_dispatch_agent old=%s, newval=%s, doit=%s",
-			(gp_use_dispatch_agent ? "true" : "false"), (newval ? "true" : "false"), (doit ? "true" : "false"));
-
-
-	if (doit)
-	{
-		/*
-		 * If we are switching, we must get rid of all existing gangs.
-		 * TODO: check for being in a transaction, or owning temp tables, as disconnecting all gangs
-		 * will wipe them out.
-		 */
-		if (newval != gp_use_dispatch_agent && Gp_role != GP_ROLE_UTILITY)
-			disconnectAndDestroyAllGangs();
-		gp_use_dispatch_agent = newval;
-	}
-
-	return true;
-}
-
-
 
 /*
  * Show hook routine for "gp_session_role" option.
@@ -953,36 +899,15 @@ gpvars_assign_gp_interconnect_type(const char *newval, bool doit, GucSource sour
 {
 	int newtype = 0;
 
-	if (newval == NULL || newval[0] == 0 ||
-		!pg_strcasecmp("tcp", newval))
-		newtype = INTERCONNECT_TYPE_TCP;
-	else if (!pg_strcasecmp("udp", newval))
-		newtype = INTERCONNECT_TYPE_UDP;
+	if (newval == NULL || newval[0] == 0)
+		newtype = INTERCONNECT_TYPE_UDPIFC;
 	else if (!pg_strcasecmp("udpifc", newval))
 		newtype = INTERCONNECT_TYPE_UDPIFC;
-	else if (!pg_strcasecmp("nil", newval))
-		newtype = INTERCONNECT_TYPE_NIL;
 	else
-		elog(ERROR, "Unknown interconnect type. (current type is '%s')", gpvars_show_gp_interconnect_type());
+		elog(ERROR, "Only support UDPIFC, (current type is '%s')", gpvars_show_gp_interconnect_type());
 
 	if (doit)
 	{
-		if (newtype == INTERCONNECT_TYPE_NIL)
-		{
-			if (Gp_role == GP_ROLE_DISPATCH)
-				elog(WARNING, "Nil-Interconnect diagnostic mode enabled (tuple will be dropped).");
-			else
-				elog(LOG, "Nil-Interconnect diagnostic mode enabled (tuple will be dropped).");
-
-		}
-		else if (Gp_interconnect_type == INTERCONNECT_TYPE_NIL)
-		{
-			if (Gp_role == GP_ROLE_DISPATCH)
-				elog(WARNING, "Nil-Interconnect diagnostic mode disabled.");
-			else
-				elog(LOG, "Nil-Interconnect diagnostic mode disabled.");
-		}
-
 		Gp_interconnect_type = newtype;
 	}
 
@@ -992,18 +917,7 @@ gpvars_assign_gp_interconnect_type(const char *newval, bool doit, GucSource sour
 const char *
 gpvars_show_gp_interconnect_type(void)
 {
-	switch(Gp_interconnect_type)
-	{
-		case INTERCONNECT_TYPE_UDP:
-			return "UDP";
-		case INTERCONNECT_TYPE_UDPIFC:
-			return "UDPIFC";
-		case INTERCONNECT_TYPE_NIL:
-			return "NIL";
-		case INTERCONNECT_TYPE_TCP:
-		default:
-			return "TCP";
-	}
+	return "UDPIFC";
 }                               /* gpvars_show_gp_log_interconnect */
 
 /*

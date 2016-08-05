@@ -9,7 +9,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/nodeHashjoin.c,v 1.89 2007/02/02 00:07:03 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/nodeHashjoin.c,v 1.93 2008/01/01 19:45:49 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -724,12 +724,11 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 					(hjstate->js.jointype == JOIN_LASJ_NOTIN) ||
 					hjstate->hj_nonequijoin;
 			if (ExecHashGetHashValue(hashState, hashtable, econtext,
-						hjstate->hj_OuterHashKeys,
-						true,
-						keep_nulls,
-						hashvalue,
-						&hashkeys_null
-						))
+									 hjstate->hj_OuterHashKeys,
+									 true,		/* outer tuple */
+									 keep_nulls,
+									 hashvalue,
+									 &hashkeys_null))
 			{
 				/* remember outer relation is not empty for possible rescan */
 				hjstate->hj_OuterNotEmpty = true;
@@ -737,8 +736,8 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 				return slot;
 			}
 			/*
-			 * That tuple couldn't match because of a NULL, so discard it
-			 * and continue with the next one.
+			 * That tuple couldn't match because of a NULL, so discard it and
+			 * continue with the next one.
 			 */
 		}
 
@@ -813,14 +812,7 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 	TupleTableSlot *slot;
 	uint32		hashvalue;
 
-#ifdef FAULT_INJECTOR
-	FaultInjector_InjectFaultIfSet(
-			FaultExecHashJoinNewBatch,
-			DDLNotSpecified,
-			"",  // databaseName
-			""); // tableName
-#endif
-
+	SIMPLE_FAULT_INJECTOR(FaultExecHashJoinNewBatch);
 
 	HashState *hashState = (HashState *) innerPlanState(hjstate);
 
@@ -1008,8 +1000,7 @@ ExecHashJoinSaveTuple(PlanState *ps, MemTuple tuple, uint32 hashvalue,
 
 		hashtable->work_set = workfile_mgr_create_set(gp_workfile_type_hashjoin,
 				true, /* can_be_reused */
-				&hashtable->hjstate->js.ps,
-				NULL_SNAPSHOT);
+				&hashtable->hjstate->js.ps);
 
 		/* First time spilling. Before creating any spill files, create a metadata file */
 		hashtable->state_file = workfile_mgr_create_fileno(hashtable->work_set, WORKFILE_NUM_HASHJOIN_METADATA);
@@ -1093,7 +1084,7 @@ ExecHashJoinGetSavedTuple(HashJoinBatchSide *batchside,
 	if (nread != memtuple_size_from_uint32(header[1]) - sizeof(uint32))
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read from temporary file")));
+				 errmsg("could not read from hash-join temporary file")));
 	return ExecStoreMinimalTuple(tuple, tupleSlot, true);
 }
 

@@ -299,15 +299,10 @@ void
 external_rescan(FileScanDesc scan)
 {
 
-	if (!scan->fs_noop)
-	{
-		/* may need to open file since beginscan doens't do it for us */
-		if (!scan->fs_file)
-			open_external_readable_source(scan);
+	/* Close previous scan if it was already open */
+	external_stopscan(scan);
 
-		/* seek to beginning of data source so we can start over */
-		url_rewind((URL_FILE*)scan->fs_file, RelationGetRelationName(scan->fs_rd));
-	}
+	/* The first call to external_getnext will re-open the scan */
 
 	/* reset some parse state variables */
 	scan->fs_pstate->fe_eof = false;
@@ -1666,12 +1661,6 @@ close_external_source(FILE *dataSource, bool failOnError, const char *relname)
 	{
 		url_fclose((URL_FILE*) f, failOnError, relname);
 	}
-
-	if (g_dataSourceCtx != NULL)
-	{
-		MemoryContextDelete(g_dataSourceCtx);
-		g_dataSourceCtx = NULL;
-	}
 }
 
 /*
@@ -1818,12 +1807,29 @@ void readHeaderLine(CopyState pstate)
 }
 
 /*
- * Free external resources on Abort.
+ * Free external resources on end of transaction.
  */
-void AtAbort_ExtTables(void)
+void AtEOXact_ExtTables(bool isCommit)
 {
-	close_external_source(g_dataSource, false, NULL);
-	g_dataSource = NULL;
+	if (g_dataSource)
+	{
+		if (isCommit)
+		{
+			/* There shouldn't be any external tables still open at commit*/
+			elog(WARNING, "external table reference leak");
+		}
+		close_external_source(g_dataSource, false, NULL);
+		g_dataSource = NULL;
+	}
+}
+
+/*
+ * Reset g_dataSourceCtx variable on EOX.
+ */
+void AtEOXact_ResetDataSourceCtx(void)
+{
+	/* g_dataSourceCtx is allocated in TopTransactionContext, so it's going away.*/
+	g_dataSourceCtx = NULL;
 }
 
 void
@@ -1856,7 +1862,7 @@ gfile_malloc(size_t size)
 {
 	if (g_dataSourceCtx == NULL)
 	{
-		g_dataSourceCtx = AllocSetContextCreate(TopMemoryContext,
+		g_dataSourceCtx = AllocSetContextCreate(TopTransactionContext,
 												"DataSourceContext",
 												ALLOCSET_SMALL_MINSIZE,
 												ALLOCSET_SMALL_INITSIZE,
@@ -2117,7 +2123,7 @@ strtokx2(const char *s,
 		 * since we do not want to change how this is stored at this point
 		 * (as it will affect previous versions of the software already
 		 * in production) the following code block will detect this scenario
-		 * where 3 quote characters follow each other, with no forth one.
+		 * where 3 quote characters follow each other, with no fourth one.
 		 * in that case, we will skip the second one (the first is skipped
 		 * just above) and the last trailing quote will be skipped below.
 		 * the result will be the actual token (''') and after stripping
@@ -2547,6 +2553,8 @@ external_set_env_vars_ext(extvar_t *extvar, char* uri, bool csv, char* escape, c
 			extvar->GP_MASTER_HOST = pstrdup(qdinfo->hostip);
 		else
 			extvar->GP_MASTER_HOST = pstrdup(qdinfo->hostname);
+
+		freeCdbComponentDatabases(cdb_component_dbs);
 	}
 
 	if (MyProcPort)

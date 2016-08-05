@@ -1,11 +1,7 @@
 #!/usr/bin/perl
 #
-# $Header$
-#
 # copyright (c) 2009, 2010, 2011
 # Author: Jeffrey I Cohen
-#
-# SLZY_HDR_END
 
 use POSIX;
 use Pod::Usage;
@@ -285,7 +281,7 @@ Jeffrey I Cohen
 
 Copyright (c) 2009-2012 Greenplum.  All rights reserved.  
 
-Address bug reports and comments to: jcohen@greenplum.com
+Address bug reports and comments to: bugs@greenplum.org
 
 =cut
 # SLZY_POD_HDR_END
@@ -1124,6 +1120,8 @@ sub parsetab
 			{
 				last # table has a toast table - ok!
 					if (exists($alltabs->{$tname}->{with}->{toast_oid}));
+				last # table has a toast table - ok!
+					if (exists($alltabs->{$tname}->{with}->{toast}));
 
 				$badmsg .= "table $tname needs toast table (toast_oid) for column $cname of type $ctype\n";
 			}

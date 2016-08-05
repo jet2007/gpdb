@@ -829,7 +829,7 @@ static void ConstructInitPlan(PartitionJoinMutatorContext *ctx)
 {
 	Assert(CurrentMemoryContext == ctx->callerCtx);
 
-	ctx->outerPlan = plan_pushdown_tlist(ctx->outerPlan, ctx->outerTargetList);
+	ctx->outerPlan = plan_pushdown_tlist(ctx->root, ctx->outerPlan, ctx->outerTargetList);
 
 	ctx->outerPlan = GatherToQD(ctx->outerPlan);
 
@@ -921,7 +921,7 @@ static Plan *TransformPartitionJoin(Plan *plan, PartitionJoinMutatorContext *ctx
 		saop->opfuncid = 184;
 		saop->useOr = true;
 
-		Result *result = make_result(child->targetlist, (Node *) list_make1(saop) /*resconstantqual */, child);
+		Result *result = make_result(ctx->root, child->targetlist, (Node *) list_make1(saop) /*resconstantqual */, child);
 		newChildren = lappend(newChildren, result);
 	}
 	append->appendplans = newChildren;
@@ -1064,6 +1064,10 @@ static void InitPMI(PartitionMatchInfo *pmi, Oid partitionOid, MemoryContext mct
 
 	pmi->partitionOid = partitionOid;
 	pmi->partitionInfo = RelationBuildPartitionDescByOid(pmi->partitionOid, false);
+	if (!pmi->partitionInfo)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation with OID %u does not exist", partitionOid)));
 
 	pmi->partitionState = createPartitionState(pmi->partitionInfo, 0);
 
@@ -1300,7 +1304,7 @@ make_mergeclause(Node *outer, Node *inner)
 
 	xpr = make_notclause((Expr *) opxpr);
 
-	rinfo = make_restrictinfo(xpr, false, false, false, NULL);
+	rinfo = make_restrictinfo(xpr, false, false, false, NULL, NULL, NULL);
 	rinfo->mergeopfamilies = get_mergejoin_opfamilies(opxpr->opno);
 
 	return rinfo;
